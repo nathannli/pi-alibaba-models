@@ -1,0 +1,47 @@
+{
+  "name": "pi-alibaba-models",
+  "version": "1.0.0",
+  "description": "Pi extension adding Alibaba Model Studio Plan and Cloud (DashScope) providers with Qwen thinking support",
+  "author": "Francesco",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fornace/pi-alibaba-models.git"
+  },
+  "homepage": "https://github.com/fornace/pi-alibaba-models#readme",
+  "bugs": {
+    "url": "https://github.com/fornace/pi-alibaba-models/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "alibaba",
+    "qwen",
+    "dashscope"
+  ],
+  "files": [
+    "extensions/**/*.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "extensions/alibaba.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@types/node": "^22.0.0",
+    "typescript": "^6.0.3"
+  }
+}
