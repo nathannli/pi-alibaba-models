@@ -47,7 +47,7 @@
     "extensions": [
       "extensions/alibaba.ts"
     ],
-    "image": "https://raw.githubusercontent.com/Fornace/pi-alibaba-models/main/screenshot.png"
+    "image": "https://raw.githubusercontent.com/Fornace/pi-alibaba-models/main/banner.jpg"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
