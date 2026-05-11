@@ -146,3 +146,12 @@ Cached at `~/.pi/agent/alibaba-plan-models.cache.json` for **48 hours**. On stal
 | `~/.pi/agent/alibaba-config.json`                     | Endpoint / domain / format config  |
 | `~/.pi/agent/alibaba-plan-models.cache.json`          | 48 h plan-models cache             |
 | `~/.pi/agent/alibaba-cloud-models.cache.json`         | 48 h cloud-models cache            |
+
+## From the same author
+
+By [Francesco Frapporti](https://fornace.it) at [Fornace](https://fornace.it).
+
+- **[pi-bench](https://github.com/fornace/pi-bench)** — LLM benchmark toolkit for pi. Probes every available model to find the fastest and cheapest.
+- **[pi-recap](https://github.com/fornace/pi-recap)** — Always-visible session recap panel for pi. Uses pi-bench data to pick the fastest summarization model.
+- **[pi-banana](https://github.com/fornace/pi-banana)** — Generate and edit images inside pi using Google Nano Banana. All package banners in this ecosystem were created with pi-banana.
+- **[pi-notte-theme](https://github.com/fornace/pi-notte-theme)** — Notte: a true-dark pi theme where darkness has color and text glows like terminal phosphor.
