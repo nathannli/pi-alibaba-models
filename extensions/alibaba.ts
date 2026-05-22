@@ -86,6 +86,49 @@ const CLOUD_FALLBACK: ProviderModelConfig[] = [
 // ── Plan model fetch + parse + cache ──────────────────────────────────
 interface PlanCache { fetchedAt: number; source: string; models: PlanModelDef[]; }
 
+// Heuristic: turn a bare model id (from /v1/models API) into a full PlanModelDef.
+function inferPlanDef(id: string): PlanModelDef {
+  const openaiOnly = /deepseek/i.test(id);
+  const isVision = /vl|vision/i.test(id) || /^qwen3\.\d+-plus$/i.test(id) || /kimi/i.test(id);
+  const isReasoning = /max|kimi|glm|minimax|deepseek|3\.6|3\.5|3\.7/i.test(id);
+  const ctxMatch = /flash/i.test(id) ? 131072 : /kimi/i.test(id) ? 262144 : 131072;
+  return {
+    id,
+    name: prettyName(id),
+    reasoning: isReasoning,
+    input: isVision ? ["text", "image"] : ["text"],
+    contextWindow: ctxMatch,
+    maxTokens: openaiOnly ? 16384 : 65536,
+    compat: isReasoning ? { thinkingFormat: "qwen" } : undefined,
+    openaiOnly,
+  };
+}
+
+// Primary source: the Plan endpoint's own /compatible-mode/v1/models.
+async function fetchPlanModelsFromAPI(credentials?: { access?: string; refresh?: string }): Promise<PlanModelDef[] | null> {
+  const key = credentials?.access;
+  if (!key) return null;
+  const ep = resolvePlanEndpoints(credentials);
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 5000);
+  try {
+    const res = await fetch(`${ep.openai}/models`, {
+      headers: { Authorization: `Bearer ${key}` },
+      signal: ctrl.signal,
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = (await res.json()) as { data?: { id: string }[] };
+    if (!json.data?.length) throw new Error("No models in response");
+    // Filter out image/audio/etc — only keep chat-capable models.
+    const exclude = /(image|audio|video|tts|asr|embed|vector|rerank|wan|omni|livetranslate|realtime)/i;
+    return json.data
+      .filter((m) => !exclude.test(m.id))
+      .map((m) => inferPlanDef(m.id));
+  } catch {
+    return null;
+  } finally { clearTimeout(t); }
+}
+
 function parseCodingPlan(src: string): PlanModelDef[] {
   // Extract every object literal containing `id: '...'`. We match a balanced-ish
   // brace block by counting from the `{` preceding `id: '...'`. The upstream file
@@ -139,7 +182,7 @@ function prettyName(id: string): string {
   return id;
 }
 
-async function fetchPlanModels(force = false): Promise<PlanModelDef[]> {
+async function fetchPlanModels(force = false, credentials?: { access?: string; refresh?: string }): Promise<PlanModelDef[]> {
   // Use cache if fresh and not forced.
   if (!force) {
     const cache = readJSON<PlanCache | null>(PLAN_CACHE_PATH, null);
@@ -147,6 +190,17 @@ async function fetchPlanModels(force = false): Promise<PlanModelDef[]> {
       return cache.models;
     }
   }
+
+  // 1) Try the Plan endpoint's own /compatible-mode/v1/models API.
+  const apiModels = await fetchPlanModelsFromAPI(credentials);
+  if (apiModels && apiModels.length) {
+    const ep = resolvePlanEndpoints(credentials);
+    const cache: PlanCache = { fetchedAt: Date.now(), source: `${ep.openai}/models`, models: apiModels };
+    writeJSON(PLAN_CACHE_PATH, cache);
+    return apiModels;
+  }
+
+  // 2) Fall back to parsing the upstream Qwen-Code TypeScript template.
   try {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), 4000);
@@ -165,7 +219,7 @@ async function fetchPlanModels(force = false): Promise<PlanModelDef[]> {
     writeJSON(PLAN_CACHE_PATH, cache);
     return models;
   } catch {
-    // Fall through to whatever we have (stale cache or hardcoded).
+    // 3) Fall through to stale cache or hardcoded fallback.
     const cache = readJSON<PlanCache | null>(PLAN_CACHE_PATH, null);
     return cache?.models?.length ? cache.models : PLAN_MODEL_DEFS_FALLBACK;
   }
@@ -422,7 +476,8 @@ export default function (pi: ExtensionAPI) {
   // ── Lazy refresh: fetch live catalogs and re-register ───────────────
   pi.on("session_start", async () => {
     try {
-      planDefs = await fetchPlanModels();
+      const planCred = readAuth()["alibaba-plan"];
+      planDefs = await fetchPlanModels(false, planCred);
     } catch {}
 
     try {
@@ -545,7 +600,8 @@ export default function (pi: ExtensionAPI) {
 
       if (choice === "Refresh model lists") {
         try {
-          planDefs = await fetchPlanModels(true);
+          const planCred = readAuth()["alibaba-plan"];
+          planDefs = await fetchPlanModels(true, planCred);
           let cloudCount = 0;
           if (cloudCred?.key || cloudCred?.access) {
             const domain = cfg.cloudDomain || DEFAULT_CLOUD_DOMAIN;
