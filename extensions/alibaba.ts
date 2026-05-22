@@ -10,8 +10,7 @@ const AUTH_PATH = path.join(HOME_DIR, "auth.json");
 const PLAN_CACHE_PATH = path.join(HOME_DIR, "alibaba-plan-models.cache.json");
 const CLOUD_CACHE_PATH = path.join(HOME_DIR, "alibaba-cloud-models.cache.json");
 
-const PLAN_MODELS_SOURCE = "https://raw.githubusercontent.com/QwenLM/qwen-code/main/packages/cli/src/constants/codingPlan.ts";
-const MODELS_CACHE_TTL_MS = 48 * 60 * 60 * 1000;
+const MODELS_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
 
 const DEFAULT_PLAN_OPENAI = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1";
 const DEFAULT_PLAN_ANTHROPIC = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
@@ -55,12 +54,6 @@ const PLAN_MODEL_DEFS_FALLBACK: PlanModelDef[] = [
   { id: "glm-4.7",               name: "GLM-4.7",            reasoning: true,  input: ["text"],          contextWindow: 202752,  maxTokens: 16384, compat: { thinkingFormat: "qwen" } },
   { id: "MiniMax-M2.5",          name: "MiniMax M2.5",       reasoning: true,  input: ["text"],          contextWindow: 196608,  maxTokens: 24576, compat: { thinkingFormat: "qwen" } },
   { id: "kimi-k2.5",             name: "Kimi K2.5",          reasoning: true,  input: ["text"],          contextWindow: 262144,  maxTokens: 16384, compat: { thinkingFormat: "qwen" } },
-  { id: "deepseek-v3.2",         name: "DeepSeek V3.2",      reasoning: true,  input: ["text"],          contextWindow: 131072,  maxTokens: 16384, openaiOnly: true },
-];
-
-// Always-include extras for Plan: real models served on the plan endpoint
-// that aren't listed in the upstream qwen-code template file. Verified live.
-const PLAN_EXTRAS: PlanModelDef[] = [
   { id: "deepseek-v3.2",         name: "DeepSeek V3.2",      reasoning: true,  input: ["text"],          contextWindow: 131072,  maxTokens: 16384, openaiOnly: true },
 ];
 
@@ -129,47 +122,6 @@ async function fetchPlanModelsFromAPI(credentials?: { access?: string; refresh?:
   } finally { clearTimeout(t); }
 }
 
-function parseCodingPlan(src: string): PlanModelDef[] {
-  // Extract every object literal containing `id: '...'`. We match a balanced-ish
-  // brace block by counting from the `{` preceding `id: '...'`. The upstream file
-  // is plain TS object literals (no nested template literals, no `}` in strings).
-  const out = new Map<string, PlanModelDef>();
-  const idRe = /\bid:\s*['"]([^'"]+)['"]/g;
-  let m: RegExpExecArray | null;
-  while ((m = idRe.exec(src)) !== null) {
-    const id = m[1];
-    if (out.has(id)) continue;
-    // Walk backwards to find the opening `{` of this object literal.
-    let i = m.index;
-    while (i > 0 && src[i] !== "{") i--;
-    if (src[i] !== "{") continue;
-    // Walk forward to find the matching `}`.
-    let depth = 0, j = i;
-    for (; j < src.length; j++) {
-      const c = src[j];
-      if (c === "{") depth++;
-      else if (c === "}") { depth--; if (depth === 0) { j++; break; } }
-    }
-    const block = src.slice(i, j);
-    const ctx = block.match(/contextWindowSize:\s*(\d+)/);
-    const thinking = /enable_thinking:\s*true/.test(block);
-    const openaiOnly = /deepseek/i.test(id);
-    // Vision-capable: explicit vl/vision in id, OR qwen plus models (qwen3.x-plus accept images).
-    const isVision = /vl|vision/i.test(id) || /^qwen3\.\d+-plus$/i.test(id);
-    out.set(id, {
-      id,
-      name: prettyName(id),
-      reasoning: thinking || /max|kimi|glm|minimax|deepseek/i.test(id),
-      input: isVision ? ["text", "image"] : ["text"],
-      contextWindow: ctx ? parseInt(ctx[1], 10) : 131072,
-      maxTokens: openaiOnly ? 16384 : 65536,
-      compat: thinking || /max|kimi|glm|minimax/i.test(id) ? { thinkingFormat: "qwen" } : undefined,
-      openaiOnly,
-    });
-  }
-  return Array.from(out.values());
-}
-
 function prettyName(id: string): string {
   // qwen3.6-plus → "Qwen 3.6 Plus", glm-5 → "GLM-5", MiniMax-M2.5 → "MiniMax M2.5"
   if (/^qwen/i.test(id)) {
@@ -200,29 +152,9 @@ async function fetchPlanModels(force = false, credentials?: { access?: string; r
     return apiModels;
   }
 
-  // 2) Fall back to parsing the upstream Qwen-Code TypeScript template.
-  try {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 4000);
-    const res = await fetch(PLAN_MODELS_SOURCE, { signal: ctrl.signal });
-    clearTimeout(t);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const text = await res.text();
-    const models = parseCodingPlan(text);
-    if (!models.length) throw new Error("parser returned 0 models");
-    // Targeted allow-list: real models that work on the plan endpoint but
-    // aren't in the qwen-code template file. Keep this minimal — anything
-    // here will appear in the picker even if upstream drops it.
-    const have = new Set(models.map((m) => m.id));
-    for (const f of PLAN_EXTRAS) if (!have.has(f.id)) models.push(f);
-    const cache: PlanCache = { fetchedAt: Date.now(), source: PLAN_MODELS_SOURCE, models };
-    writeJSON(PLAN_CACHE_PATH, cache);
-    return models;
-  } catch {
-    // 3) Fall through to stale cache or hardcoded fallback.
-    const cache = readJSON<PlanCache | null>(PLAN_CACHE_PATH, null);
-    return cache?.models?.length ? cache.models : PLAN_MODEL_DEFS_FALLBACK;
-  }
+  // 2) Fall through to stale cache or hardcoded fallback.
+  const cache = readJSON<PlanCache | null>(PLAN_CACHE_PATH, null);
+  return cache?.models?.length ? cache.models : PLAN_MODEL_DEFS_FALLBACK;
 }
 
 // ── Plan endpoint resolution ──────────────────────────────────────────
@@ -312,10 +244,21 @@ function buildCloudModels(models: ProviderModelConfig[], domain: string, fmt: st
 }
 
 // ── Module-level mutable model lists ─────────────────────────────────
-// Start with hardcoded for instant picker availability. Updated by lazy
-// session_start fetch so modifyModels (which closes over these) always
-// sees the latest roster without needing to re-register the OAuth hook.
-let planDefs: PlanModelDef[] = [...PLAN_MODEL_DEFS_FALLBACK];
+// Start from cache (if fresh and non-empty) so models registered at
+// startup match what's actually available. Falls back to hardcoded list.
+// Updated by lazy session_start fetch so modifyModels (which closes over
+// these) always sees the latest roster without needing to re-register the
+// OAuth hook.
+function loadCachedPlan(): PlanModelDef[] {
+  try {
+    const cache = readJSON<PlanCache | null>(PLAN_CACHE_PATH, null);
+    if (cache?.models?.length && Date.now() - cache.fetchedAt < MODELS_CACHE_TTL_MS) {
+      return cache.models;
+    }
+  } catch {}
+  return [...PLAN_MODEL_DEFS_FALLBACK];
+}
+let planDefs: PlanModelDef[] = loadCachedPlan();
 let cloudDefs: ProviderModelConfig[] = [...CLOUD_FALLBACK];
 
 // ── Migration ─────────────────────────────────────────────────────────
