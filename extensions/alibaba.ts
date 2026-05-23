@@ -43,39 +43,6 @@ interface PlanModelDef {
   input: ("text" | "image")[]; compat?: { thinkingFormat: "qwen" }; openaiOnly?: boolean;
 }
 
-// Hardcoded fallback (used when upstream fetch fails and no cache exists).
-const PLAN_MODEL_DEFS_FALLBACK: PlanModelDef[] = [
-  { id: "qwen3.6-plus",          name: "Qwen 3.6 Plus",      reasoning: true,  input: ["text", "image"], contextWindow: 1000000, maxTokens: 65536, compat: { thinkingFormat: "qwen" } },
-  { id: "qwen3.5-plus",          name: "Qwen 3.5 Plus",      reasoning: true,  input: ["text", "image"], contextWindow: 1000000, maxTokens: 65536, compat: { thinkingFormat: "qwen" } },
-  { id: "qwen3-coder-plus",      name: "Qwen 3 Coder Plus",  reasoning: false, input: ["text"],          contextWindow: 1000000, maxTokens: 65536 },
-  { id: "qwen3-coder-next",      name: "Qwen 3 Coder Next",  reasoning: false, input: ["text"],          contextWindow: 262144,  maxTokens: 65536 },
-  { id: "qwen3-max-2026-01-23",  name: "Qwen 3 Max",         reasoning: true,  input: ["text"],          contextWindow: 262144,  maxTokens: 16384, compat: { thinkingFormat: "qwen" } },
-  { id: "glm-5",                 name: "GLM-5",              reasoning: true,  input: ["text"],          contextWindow: 202752,  maxTokens: 16384, compat: { thinkingFormat: "qwen" } },
-  { id: "glm-4.7",               name: "GLM-4.7",            reasoning: true,  input: ["text"],          contextWindow: 202752,  maxTokens: 16384, compat: { thinkingFormat: "qwen" } },
-  { id: "MiniMax-M2.5",          name: "MiniMax M2.5",       reasoning: true,  input: ["text"],          contextWindow: 196608,  maxTokens: 24576, compat: { thinkingFormat: "qwen" } },
-  { id: "kimi-k2.5",             name: "Kimi K2.5",          reasoning: true,  input: ["text"],          contextWindow: 262144,  maxTokens: 16384, compat: { thinkingFormat: "qwen" } },
-  { id: "deepseek-v3.2",         name: "DeepSeek V3.2",      reasoning: true,  input: ["text"],          contextWindow: 131072,  maxTokens: 16384, openaiOnly: true },
-];
-
-// ── Cloud fallback ────────────────────────────────────────────────────
-// Used both when /v1/models fetch fails AND merged into live results so
-// curated/announced models always appear in the picker, even if DashScope's
-// catalog hasn't surfaced them yet on this region/account.
-const CLOUD_FALLBACK: ProviderModelConfig[] = [
-  { id: "qwen3.6-plus",      name: "Qwen 3.6 Plus",  reasoning: true,  input: ["text", "image"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 8192, compat: { thinkingFormat: "qwen" } },
-  { id: "qwen3.6-max-preview", name: "Qwen 3.6 Max (preview)", reasoning: true, input: ["text", "image"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 8192, compat: { thinkingFormat: "qwen" } },
-  { id: "qwen-max",          name: "Qwen Max",       reasoning: false, input: ["text", "image"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 8192 },
-  { id: "qwen-plus",         name: "Qwen Plus",      reasoning: false, input: ["text", "image"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 8192 },
-  { id: "qwen-turbo",        name: "Qwen Turbo",     reasoning: false, input: ["text", "image"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 8192 },
-  { id: "qwen-long",         name: "Qwen Long",      reasoning: false, input: ["text"],          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000000, maxTokens: 8192 },
-  { id: "qwen-coder-plus",   name: "Qwen Coder Plus",reasoning: false, input: ["text"],          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 8192 },
-  { id: "deepseek-v3.2",     name: "DeepSeek V3.2",  reasoning: true,  input: ["text"],          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 131072, maxTokens: 8192 },
-];
-
-// CLOUD_FALLBACK is used ONLY when the live /v1/models fetch fails. Live
-// catalog is the single source of truth on success — invented or stale ids
-// in fallback must never leak into the picker.
-
 // ── Plan model fetch + parse + cache ──────────────────────────────────
 interface PlanCache { fetchedAt: number; source: string; models: PlanModelDef[]; }
 
@@ -152,9 +119,11 @@ async function fetchPlanModels(force = false, credentials?: { access?: string; r
     return apiModels;
   }
 
-  // 2) Fall through to stale cache or hardcoded fallback.
+  // 2) No hardcoded fallback — if API is unreachable and there's no
+  // stale cache, let it error so the user sees it immediately.
   const cache = readJSON<PlanCache | null>(PLAN_CACHE_PATH, null);
-  return cache?.models?.length ? cache.models : PLAN_MODEL_DEFS_FALLBACK;
+  if (cache?.models?.length) return cache.models;
+  throw new Error("Plan model fetch failed: API unreachable and no stale cache available");
 }
 
 // ── Plan endpoint resolution ──────────────────────────────────────────
@@ -244,8 +213,7 @@ function buildCloudModels(models: ProviderModelConfig[], domain: string, fmt: st
 }
 
 // ── Module-level mutable model lists ─────────────────────────────────
-// Start from cache (if fresh and non-empty) so models registered at
-// startup match what's actually available. Falls back to hardcoded list.
+// Start from cache (if fresh and non-empty). No hardcoded fallbacks.
 // Updated by lazy session_start fetch so modifyModels (which closes over
 // these) always sees the latest roster without needing to re-register the
 // OAuth hook.
@@ -256,10 +224,10 @@ function loadCachedPlan(): PlanModelDef[] {
       return cache.models;
     }
   } catch {}
-  return [...PLAN_MODEL_DEFS_FALLBACK];
+  return [];
 }
 let planDefs: PlanModelDef[] = loadCachedPlan();
-let cloudDefs: ProviderModelConfig[] = [...CLOUD_FALLBACK];
+let cloudDefs: ProviderModelConfig[] = [];
 
 // ── Migration ─────────────────────────────────────────────────────────
 const isPlanKey = (k: string) => k.startsWith("sk-sp-") || k.startsWith("sk-tok-");
@@ -418,20 +386,16 @@ export default function (pi: ExtensionAPI) {
 
   // ── Lazy refresh: fetch live catalogs and re-register ───────────────
   pi.on("session_start", async () => {
-    try {
-      const planCred = readAuth()["alibaba-plan"];
-      planDefs = await fetchPlanModels(false, planCred);
-    } catch {}
+    const planCred = readAuth()["alibaba-plan"];
+    planDefs = await fetchPlanModels(false, planCred);
 
-    try {
-      const auth = readAuth();
-      const key = auth["alibaba-cloud"]?.key || auth["alibaba-cloud"]?.access;
-      if (key) {
-        const cfg = loadConfig();
-        const domain = cfg.cloudDomain || DEFAULT_CLOUD_DOMAIN;
-        cloudDefs = await fetchCloudModels(domain, key);
-      }
-    } catch {}
+    const auth = readAuth();
+    const key = auth["alibaba-cloud"]?.key || auth["alibaba-cloud"]?.access;
+    if (key) {
+      const cfg = loadConfig();
+      const domain = cfg.cloudDomain || DEFAULT_CLOUD_DOMAIN;
+      cloudDefs = await fetchCloudModels(domain, key);
+    }
 
     // Re-register both providers with the expanded model lists
     const currentConfig = loadConfig();
