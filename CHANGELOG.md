@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.8
+
+- Fix startup model resolution by making the extension factory async and fetching live Plan/Cloud catalogs before provider registration. Pi now validates `enabledModels` against the real API model lists immediately, eliminating startup "No models match pattern" warnings without hardcoded or cache fallbacks.
+
 ## 1.0.7
 
 - Bump (1.0.6 already published).

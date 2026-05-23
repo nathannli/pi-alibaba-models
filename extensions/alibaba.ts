@@ -65,9 +65,9 @@ function inferPlanDef(id: string): PlanModelDef {
 }
 
 // Primary source: the Plan endpoint's own /compatible-mode/v1/models.
-async function fetchPlanModelsFromAPI(credentials?: { access?: string; refresh?: string }): Promise<PlanModelDef[] | null> {
+async function fetchPlanModelsFromAPI(credentials?: { access?: string; refresh?: string }): Promise<PlanModelDef[]> {
   const key = credentials?.access;
-  if (!key) return null;
+  if (!key) return [];
   const ep = resolvePlanEndpoints(credentials);
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 5000);
@@ -84,8 +84,6 @@ async function fetchPlanModelsFromAPI(credentials?: { access?: string; refresh?:
     return json.data
       .filter((m) => !exclude.test(m.id))
       .map((m) => inferPlanDef(m.id));
-  } catch {
-    return null;
   } finally { clearTimeout(t); }
 }
 
@@ -101,29 +99,14 @@ function prettyName(id: string): string {
   return id;
 }
 
-async function fetchPlanModels(force = false, credentials?: { access?: string; refresh?: string }): Promise<PlanModelDef[]> {
-  // Use cache if fresh and not forced.
-  if (!force) {
-    const cache = readJSON<PlanCache | null>(PLAN_CACHE_PATH, null);
-    if (cache && Date.now() - cache.fetchedAt < MODELS_CACHE_TTL_MS && cache.models?.length) {
-      return cache.models;
-    }
-  }
-
-  // 1) Try the Plan endpoint's own /compatible-mode/v1/models API.
+async function fetchPlanModels(_force = false, credentials?: { access?: string; refresh?: string }): Promise<PlanModelDef[]> {
+  if (!credentials?.access) return [];
   const apiModels = await fetchPlanModelsFromAPI(credentials);
-  if (apiModels && apiModels.length) {
-    const ep = resolvePlanEndpoints(credentials);
-    const cache: PlanCache = { fetchedAt: Date.now(), source: `${ep.openai}/models`, models: apiModels };
-    writeJSON(PLAN_CACHE_PATH, cache);
-    return apiModels;
-  }
-
-  // 2) No hardcoded fallback — if API is unreachable and there's no
-  // stale cache, let it error so the user sees it immediately.
-  const cache = readJSON<PlanCache | null>(PLAN_CACHE_PATH, null);
-  if (cache?.models?.length) return cache.models;
-  throw new Error("Plan model fetch failed: API unreachable and no stale cache available");
+  if (!apiModels.length) throw new Error("Plan model fetch returned no chat models");
+  const ep = resolvePlanEndpoints(credentials);
+  const cache: PlanCache = { fetchedAt: Date.now(), source: `${ep.openai}/models`, models: apiModels };
+  writeJSON(PLAN_CACHE_PATH, cache);
+  return apiModels;
 }
 
 // ── Plan endpoint resolution ──────────────────────────────────────────
@@ -158,14 +141,7 @@ function buildPlanModels(defs: PlanModelDef[], openaiUrl: string, anthropicUrl: 
 // ── Cloud builders ────────────────────────────────────────────────────
 interface CloudCache { fetchedAt: number; domain: string; models: ProviderModelConfig[]; }
 
-async function fetchCloudModels(domain: string, apiKey: string, force = false): Promise<ProviderModelConfig[]> {
-  // Cache hit: same domain, fresh, non-empty.
-  if (!force) {
-    const cache = readJSON<CloudCache | null>(CLOUD_CACHE_PATH, null);
-    if (cache && cache.domain === domain && Date.now() - cache.fetchedAt < MODELS_CACHE_TTL_MS && cache.models?.length) {
-      return cache.models;
-    }
-  }
+async function fetchCloudModels(domain: string, apiKey: string, _force = false): Promise<ProviderModelConfig[]> {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 4000);
   try {
@@ -213,20 +189,9 @@ function buildCloudModels(models: ProviderModelConfig[], domain: string, fmt: st
 }
 
 // ── Module-level mutable model lists ─────────────────────────────────
-// Start from cache (if fresh and non-empty). No hardcoded fallbacks.
-// Updated by lazy session_start fetch so modifyModels (which closes over
-// these) always sees the latest roster without needing to re-register the
-// OAuth hook.
-function loadCachedPlan(): PlanModelDef[] {
-  try {
-    const cache = readJSON<PlanCache | null>(PLAN_CACHE_PATH, null);
-    if (cache?.models?.length && Date.now() - cache.fetchedAt < MODELS_CACHE_TTL_MS) {
-      return cache.models;
-    }
-  } catch {}
-  return [];
-}
-let planDefs: PlanModelDef[] = loadCachedPlan();
+// Populated by the async extension factory before provider registration.
+// No hardcoded or cache fallbacks: live API response is the source of truth.
+let planDefs: PlanModelDef[] = [];
 let cloudDefs: ProviderModelConfig[] = [];
 
 // ── Migration ─────────────────────────────────────────────────────────
@@ -304,11 +269,10 @@ function migrateLegacyAuth() {
 }
 
 // ── Main ──────────────────────────────────────────────────────────────
-// Synchronous factory: register hardcoded models instantly so they appear
-// in the picker without any network round-trip. A session_start handler
-// fires later, fetches the live catalogs, and re-registers both providers
-// (full replacement) to augment the list with newly-discovered models.
-export default function (pi: ExtensionAPI) {
+// Async factory: pi awaits this before provider registrations are flushed.
+// Fetch live model catalogs before registerProvider() so enabledModels
+// validation sees the real catalog immediately. No fallbacks.
+export default async function (pi: ExtensionAPI) {
   migrateLegacyAuth();
   const config = loadConfig();
 
@@ -320,11 +284,17 @@ export default function (pi: ExtensionAPI) {
     cloudKey = auth["alibaba-cloud"]?.key || auth["alibaba-cloud"]?.access || null;
   } catch {}
 
-  // ── Plan provider (instant, hardcoded) ──────────────────────────────
+  // ── Live catalog fetch (before provider registration) ───────────────
   let planCreds: { access?: string; refresh?: string } | undefined;
   if (planKey) { try { planCreds = readAuth()["alibaba-plan"]; } catch {} }
   const planEndpoints = resolvePlanEndpoints(planCreds);
+  const cloudDomain = config.cloudDomain || DEFAULT_CLOUD_DOMAIN;
+  const cloudFmt = config.cloudApiFormat || "anthropic-messages";
 
+  if (planCreds?.access) planDefs = await fetchPlanModels(true, planCreds);
+  if (cloudKey) cloudDefs = await fetchCloudModels(cloudDomain, cloudKey, true);
+
+  // ── Plan provider ───────────────────────────────────────────────────
   pi.registerProvider("alibaba-plan", {
     name: "Alibaba Model Studio Plan",
     baseUrl: planEndpoints.anthropic,
@@ -359,7 +329,7 @@ export default function (pi: ExtensionAPI) {
       getApiKey(c) { return c.access; },
       modifyModels(models, credentials) {
         const ep = resolvePlanEndpoints(credentials);
-        // Always reads the LATEST planDefs (hardcoded → session_start updated)
+        // Always reads the latest planDefs (startup fetch → session_start refresh)
         const updated = buildPlanModels(planDefs, ep.openai, ep.anthropic);
         return models.map((m) => {
           if (m.provider !== "alibaba-plan") return m;
@@ -371,10 +341,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── Cloud provider (instant, hardcoded) ────────────────────────────
-  const cloudDomain = config.cloudDomain || DEFAULT_CLOUD_DOMAIN;
-  const cloudFmt = config.cloudApiFormat || "anthropic-messages";
-
+  // ── Cloud provider ─────────────────────────────────────────────────
   pi.registerProvider("alibaba-cloud", {
     name: "Alibaba Cloud (API Key)",
     baseUrl: `https://${cloudDomain}/apps/anthropic`,
@@ -487,19 +454,20 @@ export default function (pi: ExtensionAPI) {
         const ageMin = (c: { fetchedAt: number } | null) => c ? Math.round((Date.now() - c.fetchedAt) / 60000) : null;
         const planAge = ageMin(planCache);
         const cloudAge = ageMin(cloudCache);
-        // "hardcoded" means session_start hasn't fetched live yet (or fetch failed)
         const isPlanLive = planCache && planAge !== null && planCache.models.length === planDefs.length;
         const isCloudLive = cloudCache && cloudAge !== null && cloudCache.models.length === cloudDefs.length;
+        const planState = isPlanLive ? `live, ${planAge}m old` : (planDefs.length ? "live, not cached" : "not fetched");
+        const cloudState = isCloudLive ? `live, ${cloudAge}m old` : (cloudDefs.length ? "live, not cached" : "not fetched");
         const lines = [
           `Plan:  ${planCred ? "logged in" : "not logged in"}`,
           `       Anthropic: ${ep.anthropic}`,
           `       OpenAI:    ${ep.openai}`,
-          `       Models:    ${planDefs.length} (${isPlanLive ? `live, ${planAge}m old` : "hardcoded"}${planAge !== null && !isPlanLive ? `, cache ${planAge}m old` : ""})`,
+          `       Models:    ${planDefs.length} (${planState})`,
           ``,
           `Cloud: ${cloudCred ? "logged in" : "not logged in"}`,
           `       Domain:    ${cfg.cloudDomain || DEFAULT_CLOUD_DOMAIN}`,
           `       Format:    ${cfg.cloudApiFormat || "anthropic-messages"}`,
-          `       Models:    ${cloudDefs.length} (${isCloudLive ? `live, ${cloudAge}m old` : "hardcoded"})`,
+          `       Models:    ${cloudDefs.length} (${cloudState})`,
         ].join("\n");
         ctx.ui.notify(lines, "info");
         return;
