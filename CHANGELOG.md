@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.7
+
+- Bump (1.0.6 already published).
+
 ## 1.0.6
 
 - Removed all hardcoded model fallbacks (`PLAN_MODEL_DEFS_FALLBACK`, `CLOUD_FALLBACK`). If the API is unreachable and no stale cache exists, the extension now errors immediately instead of silently degrading to a stale model list. This eliminates transient "no models match" warnings caused by the hardcoded list being out of sync with the live catalog.
