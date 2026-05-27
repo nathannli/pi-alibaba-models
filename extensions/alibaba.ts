@@ -188,9 +188,45 @@ function buildCloudModels(models: ProviderModelConfig[], domain: string, fmt: st
   });
 }
 
+// ── Offline-resilient catalog loaders ────────────────────────────────
+// Live API is the source of truth. But a network failure must never take
+// the whole extension (and therefore pi, and the user's local models) down
+// with it. So: try live, fall back to the last-known-good on-disk cache,
+// warn, and never throw. Cache is an offline fallback only — when the API
+// is reachable, its response always wins and overwrites the cache.
+const cacheAgeMin = (fetchedAt: number) => Math.round((Date.now() - fetchedAt) / 60000);
+
+async function loadPlanDefs(force: boolean, credentials?: { access?: string; refresh?: string }): Promise<PlanModelDef[]> {
+  if (!credentials?.access) return [];
+  try {
+    return await fetchPlanModels(force, credentials);
+  } catch (e: any) {
+    const cache = readJSON<PlanCache | null>(PLAN_CACHE_PATH, null);
+    if (cache?.models?.length) {
+      console.warn(`[alibaba] Plan catalog fetch failed (${e?.message || e}); using cached models (${cache.models.length}, ${cacheAgeMin(cache.fetchedAt)}m old).`);
+      return cache.models;
+    }
+    console.warn(`[alibaba] Plan catalog fetch failed (${e?.message || e}); no cache — Plan models unavailable until reconnected. Other providers still work.`);
+    return [];
+  }
+}
+
+async function loadCloudDefs(domain: string, apiKey: string, force: boolean): Promise<ProviderModelConfig[]> {
+  try {
+    return await fetchCloudModels(domain, apiKey, force);
+  } catch (e: any) {
+    const cache = readJSON<CloudCache | null>(CLOUD_CACHE_PATH, null);
+    if (cache?.models?.length && cache.domain === domain) {
+      console.warn(`[alibaba] Cloud catalog fetch failed (${e?.message || e}); using cached models (${cache.models.length}, ${cacheAgeMin(cache.fetchedAt)}m old).`);
+      return cache.models;
+    }
+    console.warn(`[alibaba] Cloud catalog fetch failed (${e?.message || e}); no cache — Cloud models unavailable until reconnected. Other providers still work.`);
+    return [];
+  }
+}
+
 // ── Module-level mutable model lists ─────────────────────────────────
 // Populated by the async extension factory before provider registration.
-// No hardcoded or cache fallbacks: live API response is the source of truth.
 let planDefs: PlanModelDef[] = [];
 let cloudDefs: ProviderModelConfig[] = [];
 
@@ -291,8 +327,8 @@ export default async function (pi: ExtensionAPI) {
   const cloudDomain = config.cloudDomain || DEFAULT_CLOUD_DOMAIN;
   const cloudFmt = config.cloudApiFormat || "anthropic-messages";
 
-  if (planCreds?.access) planDefs = await fetchPlanModels(true, planCreds);
-  if (cloudKey) cloudDefs = await fetchCloudModels(cloudDomain, cloudKey, true);
+  if (planCreds?.access) planDefs = await loadPlanDefs(true, planCreds);
+  if (cloudKey) cloudDefs = await loadCloudDefs(cloudDomain, cloudKey, true);
 
   // ── Plan provider ───────────────────────────────────────────────────
   pi.registerProvider("alibaba-plan", {
@@ -353,15 +389,16 @@ export default async function (pi: ExtensionAPI) {
 
   // ── Lazy refresh: fetch live catalogs and re-register ───────────────
   pi.on("session_start", async () => {
+   try {
     const planCred = readAuth()["alibaba-plan"];
-    planDefs = await fetchPlanModels(false, planCred);
+    planDefs = await loadPlanDefs(false, planCred);
 
     const auth = readAuth();
     const key = auth["alibaba-cloud"]?.key || auth["alibaba-cloud"]?.access;
     if (key) {
       const cfg = loadConfig();
       const domain = cfg.cloudDomain || DEFAULT_CLOUD_DOMAIN;
-      cloudDefs = await fetchCloudModels(domain, key);
+      cloudDefs = await loadCloudDefs(domain, key, false);
     }
 
     // Re-register both providers with the expanded model lists
@@ -424,6 +461,9 @@ export default async function (pi: ExtensionAPI) {
       authHeader: true,
       models: buildCloudModels(cloudDefs, currentDomain, currentFmt),
     });
+   } catch (e: any) {
+    console.warn(`[alibaba] session_start catalog refresh failed (${e?.message || e}); keeping previously loaded models.`);
+   }
   });
 
   // ── Command: /alibaba ──────────────────────────────────────────────
