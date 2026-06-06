@@ -13,7 +13,7 @@ This is a forked version of [`Fornace/pi-alibaba-models`](https://github.com/For
 - Added fallback Cloud models so `/login → Use an API key → Alibaba Cloud (API Key)` appears before credentials or a live catalog exist.
 - Added auth migration for legacy Alibaba/DashScope entries and cleanup when Cloud credentials are removed.
 - Added Cloud domain presets for Singapore, US (Virginia), China (Beijing), China (Hong Kong), and Germany (Frankfurt), including workspace ID prompts for workspace-scoped domains.
-- Added a short reload delay after `/alibaba → Refresh model lists` so refreshed Cloud catalogs persist before `pi` reloads.
+- Added a longer reload delay after `/alibaba → Refresh model lists` so refreshed Cloud catalogs persist before `pi` reloads.
 - Filtered live and cached Cloud catalogs to remove dated snapshot model IDs and undocumented/internal models such as `pre-*`.
 - Patched Cloud model context windows from Alibaba Model Studio docs instead of using generic fallbacks.
 - Set 1M-token Cloud model context windows to `1,048,576` tokens, including `qwen3.6-plus`.
