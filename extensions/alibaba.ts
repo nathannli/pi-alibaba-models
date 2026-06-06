@@ -828,14 +828,24 @@ export default async function (pi: ExtensionAPI) {
       }
 
       if (choice === "Cloud — Change Domain") {
-        const sel = await ctx.ui.select("Cloud endpoint:", [
-          "International (dashscope-intl.aliyuncs.com)",
-          "China (dashscope.aliyuncs.com)",
-          "Custom…",
-        ]);
+        const endpoints = [
+          { label: "Singapore: https://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1", domain: "{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com" },
+          { label: "US (Virginia): https://dashscope-us.aliyuncs.com/compatible-mode/v1", domain: "dashscope-us.aliyuncs.com" },
+          { label: "China (Beijing): https://dashscope.aliyuncs.com/compatible-mode/v1", domain: "dashscope.aliyuncs.com" },
+          { label: "China (Hong Kong): https://{WorkspaceId}.cn-hongkong.maas.aliyuncs.com/compatible-mode/v1", domain: "{WorkspaceId}.cn-hongkong.maas.aliyuncs.com" },
+          { label: "Germany (Frankfurt): https://{WorkspaceId}.eu-central-1.maas.aliyuncs.com/compatible-mode/v1", domain: "{WorkspaceId}.eu-central-1.maas.aliyuncs.com" },
+          { label: "Custom…", domain: "" },
+        ];
+        const sel = await ctx.ui.select("Cloud endpoint:", endpoints.map((e) => e.label));
         if (!sel) return;
-        let domain = sel.match(/\(([^)]+)\)/)?.[1] || "";
+        const endpoint = endpoints.find((e) => e.label === sel);
+        let domain = endpoint?.domain || "";
         if (sel.startsWith("Custom")) domain = (await ctx.ui.input("Cloud domain:")) || "";
+        if (domain.includes("{WorkspaceId}")) {
+          const workspaceId = (await ctx.ui.input("Workspace ID:")) || "";
+          if (!workspaceId) return;
+          domain = domain.replace("{WorkspaceId}", workspaceId);
+        }
         if (domain) {
           cfg.cloudDomain = domain; saveConfig(cfg);
           ctx.ui.notify(`Cloud domain: ${domain}`, "info");
