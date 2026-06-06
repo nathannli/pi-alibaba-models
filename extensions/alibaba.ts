@@ -51,6 +51,8 @@ interface PlanModelDef {
 // ── Plan model fetch + parse + cache ──────────────────────────────────
 interface PlanCache { fetchedAt: number; source: string; models: PlanModelDef[]; }
 
+const hasDateSuffix = (id: string) => /-\d{4}-\d{2}-\d{2}(?:-|$)/.test(id);
+
 // ── Capability heuristics (shared by Plan + Cloud) ───────────────────
 // The /models API only returns ids/names, not capabilities — so context
 // window, reasoning, and vision are inferred from the id. Both the Plan
@@ -107,11 +109,11 @@ async function fetchPlanModelsFromAPI(credentials?: { access?: string; refresh?:
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const json = (await res.json()) as { data?: { id: string }[] };
     if (!json.data?.length) throw new Error("No models in response");
-    // Filter out image/audio/etc — only keep chat-capable models.
+    // Filter out image/audio/etc and dated variants — only keep canonical chat models.
     const exclude = /(image|audio|video|tts|asr|embed|vector|rerank|wan|omni|livetranslate|realtime)/i;
     const overrides = loadConfig().contextWindowOverrides;
     return json.data
-      .filter((m) => !exclude.test(m.id))
+      .filter((m) => !exclude.test(m.id) && !hasDateSuffix(m.id))
       .map((m) => inferPlanDef(m.id, overrides));
   } finally { clearTimeout(t); }
 }
@@ -154,7 +156,7 @@ function resolvePlanEndpoints(credentials?: { access?: string; refresh?: string 
 }
 
 function buildPlanModels(defs: PlanModelDef[], openaiUrl: string, anthropicUrl: string): ProviderModelConfig[] {
-  return defs.map((m) => {
+  return defs.filter((m) => !hasDateSuffix(m.id)).map((m) => {
     const useOpenAI = !!m.openaiOnly || /deepseek/i.test(m.id);
     return {
       id: m.id, name: m.name, reasoning: m.reasoning, input: m.input,
@@ -185,7 +187,7 @@ async function fetchCloudModels(domain: string, apiKey: string, _force = false):
     const exclude = /(image|audio|video|tts|asr|embed|vector|rerank|wan|omni|livetranslate|realtime)/i;
     const overrides = loadConfig().contextWindowOverrides;
     const models = json.data
-      .filter((m) => !exclude.test(m.id))
+      .filter((m) => !exclude.test(m.id) && !hasDateSuffix(m.id))
       .map((m) => {
         const isVision = isVisionModel(m.id);
         const isReasoning = isReasoningModel(m.id);
@@ -207,7 +209,7 @@ async function fetchCloudModels(domain: string, apiKey: string, _force = false):
 }
 
 function buildCloudModels(models: ProviderModelConfig[], domain: string, fmt: string): ProviderModelConfig[] {
-  return models.map((m) => {
+  return models.filter((m) => !hasDateSuffix(m.id)).map((m) => {
     const useOpenAI = /deepseek/i.test(m.id) || fmt === "openai-completions";
     return {
       ...m,
