@@ -15,7 +15,7 @@ This is a forked version of [`Fornace/pi-alibaba-models`](https://github.com/For
 - Added a short reload delay after `/alibaba → Refresh model lists` so refreshed Cloud catalogs persist before `pi` reloads.
 - Filtered live Cloud and cached model catalogs to remove dated snapshot model IDs and undocumented/internal models such as `pre-*`.
 - Patched Cloud model context windows from Alibaba Model Studio docs instead of using a generic fallback.
-- Set `qwen3.6-plus` context window to 1,048,576 tokens.
+- Set 1M-token Cloud model context windows to 1,048,576 tokens.
 
 ## Features
 
