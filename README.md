@@ -2,6 +2,21 @@
 
 The complete [`pi`](https://github.com/badlogic/pi-mono) extension for Alibaba's model lineup — **Qwen 3.7 Max**, **Qwen 3.7 Plus** (both 1M context), **Qwen 3.6 Max**, **Qwen 3.6 Plus**, **DeepSeek V4 Pro**, **Kimi K2.6**, **GLM-5**, **MiniMax M2.5**, and the rest of the catalog. Native thinking-level support, both Anthropic- and OpenAI-shaped APIs, both International and China endpoints, both Coding Plan subscriptions and pay-per-token Cloud keys.
 
+## Fork notice
+
+This is a forked version of [`Fornace/pi-alibaba-models`](https://github.com/Fornace/pi-alibaba-models) with local fixes for current `pi` provider registration, Alibaba Cloud API-key login, Cloud region selection, and live model catalog cleanup.
+
+## Fork feature changelog
+
+- Fixed DashScope API-key provider registration for newer `pi` versions by using `$DASHSCOPE_API_KEY`.
+- Kept the Cloud provider visible in `/login → Use an API key` before a live catalog is fetched by registering fallback Cloud models.
+- Added auth migration for legacy Alibaba/DashScope auth entries and cleanup on Cloud logout.
+- Added Cloud domain presets for Singapore, US (Virginia), China (Beijing), China (Hong Kong), and Germany (Frankfurt), with workspace ID prompts for workspace-scoped domains.
+- Added a short reload delay after `/alibaba → Refresh model lists` so refreshed Cloud catalogs persist before `pi` reloads.
+- Filtered live Cloud and cached model catalogs to remove dated snapshot model IDs and undocumented/internal models such as `pre-*`.
+- Patched Cloud model context windows from Alibaba Model Studio docs instead of using a generic fallback.
+- Set `qwen3.6-plus` context window to 1,048,576 tokens.
+
 ## Features
 
 - **Dual Provider Support**: Both the subscription-based Model Studio Coding Plan **and** the pay-per-token Alibaba Cloud (DashScope) — registered side by side, switch per chat from the model picker.
