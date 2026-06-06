@@ -8,14 +8,30 @@ This is a forked version of [`Fornace/pi-alibaba-models`](https://github.com/For
 
 ## Fork feature changelog
 
-- Fixed DashScope API-key provider registration for newer `pi` versions by using `$DASHSCOPE_API_KEY`.
-- Kept the Cloud provider visible in `/login → Use an API key` before a live catalog is fetched by registering fallback Cloud models.
-- Added auth migration for legacy Alibaba/DashScope auth entries and cleanup on Cloud logout.
-- Added Cloud domain presets for Singapore, US (Virginia), China (Beijing), China (Hong Kong), and Germany (Frankfurt), with workspace ID prompts for workspace-scoped domains.
+- Fixed DashScope env-var registration for newer `pi` versions by using `$DASHSCOPE_API_KEY`.
+- Registered Alibaba Cloud as an API-key provider while keeping the provider id `alibaba-cloud` and display name `Alibaba Cloud (API Key)`.
+- Added fallback Cloud models so `/login → Use an API key → Alibaba Cloud (API Key)` appears before credentials or a live catalog exist.
+- Added auth migration for legacy Alibaba/DashScope entries and cleanup when Cloud credentials are removed.
+- Added Cloud domain presets for Singapore, US (Virginia), China (Beijing), China (Hong Kong), and Germany (Frankfurt), including workspace ID prompts for workspace-scoped domains.
 - Added a short reload delay after `/alibaba → Refresh model lists` so refreshed Cloud catalogs persist before `pi` reloads.
-- Filtered live Cloud and cached model catalogs to remove dated snapshot model IDs and undocumented/internal models such as `pre-*`.
-- Patched Cloud model context windows from Alibaba Model Studio docs instead of using a generic fallback.
-- Set 1M-token Cloud model context windows to 1,048,576 tokens.
+- Filtered live and cached Cloud catalogs to remove dated snapshot model IDs and undocumented/internal models such as `pre-*`.
+- Patched Cloud model context windows from Alibaba Model Studio docs instead of using generic fallbacks.
+- Set 1M-token Cloud model context windows to `1,048,576` tokens, including `qwen3.6-plus`.
+
+## Install this fork
+
+```bash
+git clone git@github.com:nathannli/pi-alibaba-models.git
+cd pi-alibaba-models
+
+# Remove an existing install first, if present.
+pi remove pi-alibaba-models || true
+
+# Install from this local checkout.
+pi install "$(pwd)"
+```
+
+After install, restart `pi` or run `/reload`.
 
 ## Features
 
@@ -37,21 +53,14 @@ This is a forked version of [`Fornace/pi-alibaba-models`](https://github.com/For
 5. Paste your token when prompted.
 6. Open the model picker, select a model (e.g., `Qwen 3.7 Max`, `Qwen 3.7 Plus`, `Qwen 3.6 Max`, or `DeepSeek V4 Pro`), and start chatting!
 
-## Install
+## Upstream install alternatives
+
+To install the original upstream package instead of this fork:
 
 ```bash
-# recommended
 pi install pi-alibaba-models
-
-# explicit npm form (fallback if the bare name doesn't resolve)
 pi install npm:pi-alibaba-models
-
-# or from GitHub
 pi install git:github.com/Fornace/pi-alibaba-models
-
-# or from a local checkout (development)
-git clone https://github.com/Fornace/pi-alibaba-models
-cd pi-alibaba-models && pi install .
 ```
 
 After install, restart `pi`. The extension registers two providers and a slash command on every boot.
