@@ -455,8 +455,33 @@ export default async function (pi: ExtensionAPI) {
   });
 
   // ── Lazy refresh: fetch live catalogs and re-register ───────────────
-  pi.on("session_start", async () => {
+  pi.on("session_start", async (_event, ctx) => {
    try {
+    // ── Logout hook: clear Cloud models when credential is removed ─────
+    // pi's /logout calls authStorage.remove() then modelRegistry.refresh(),
+    // but refresh() only reloads base models from disk — extension-registered
+    // models persist in memory. Hook remove() to re-register with 0 models,
+    // making Cloud models disappear from the picker on logout.
+    // After logout, /reload restores the provider for re-login.
+    if (ctx?.modelRegistry?.authStorage && !(ctx.modelRegistry.authStorage as any).__alibabaHooked) {
+      const originalRemove = ctx.modelRegistry.authStorage.remove.bind(ctx.modelRegistry.authStorage);
+      ctx.modelRegistry.authStorage.remove = (provider: string) => {
+        originalRemove(provider);
+        if (provider === "alibaba-cloud") {
+          cloudDefs = [];
+          pi.registerProvider("alibaba-cloud", {
+            name: "Alibaba Cloud (API Key)",
+            baseUrl: `https://${loadConfig().cloudDomain || DEFAULT_CLOUD_DOMAIN}/apps/anthropic`,
+            apiKey: "$DASHSCOPE_API_KEY",
+            api: "anthropic-messages",
+            authHeader: true,
+            models: [],
+          });
+        }
+      };
+      (ctx.modelRegistry.authStorage as any).__alibabaHooked = true;
+    }
+
     const planCred = readAuth()["alibaba-plan"];
     planDefs = await loadPlanDefs(false, planCred);
 
