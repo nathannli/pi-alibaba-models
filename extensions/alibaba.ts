@@ -46,18 +46,38 @@ interface PlanModelDef {
 // ── Plan model fetch + parse + cache ──────────────────────────────────
 interface PlanCache { fetchedAt: number; source: string; models: PlanModelDef[]; }
 
+// ── Capability heuristics (shared by Plan + Cloud) ───────────────────
+// The /models API only returns ids/names, not capabilities — so context
+// window, reasoning, and vision are inferred from the id. Both the Plan
+// and Cloud code paths route through these helpers so they never drift
+// apart. Context windows reflect Alibaba's published specs as of June 2026
+// and are corrected here as new models ship.
+const isVisionModel = (id: string): boolean =>
+  /vl|vision/i.test(id) || /^qwen3\.\d+-plus\b/i.test(id) || /kimi/i.test(id);
+
+const isReasoningModel = (id: string): boolean =>
+  /qwq|max|thinking|deepseek|minimax|kimi|glm|3\.[5-9]/i.test(id);
+
+const inferContextWindow = (id: string): number => {
+  if (/flash/i.test(id)) return 131072;
+  if (/kimi/i.test(id)) return 262144;
+  if (/^qwen3\.6-max\b/i.test(id)) return 262144; // 3.6 Max = 256K
+  // 3.6 Plus and every 3.7+ Plus/Max ship a 1M context window.
+  if (/^qwen3\.6-plus\b/i.test(id) || /^qwen3\.([7-9]|\d{2,})-(plus|max)\b/i.test(id)) return 1048576;
+  return 131072;
+};
+
 // Heuristic: turn a bare model id (from /v1/models API) into a full PlanModelDef.
 function inferPlanDef(id: string): PlanModelDef {
   const openaiOnly = /deepseek/i.test(id);
-  const isVision = /vl|vision/i.test(id) || /^qwen3\.\d+-plus$/i.test(id) || /kimi/i.test(id);
-  const isReasoning = /max|kimi|glm|minimax|deepseek|3\.6|3\.5|3\.7/i.test(id);
-  const ctxMatch = /flash/i.test(id) ? 131072 : /kimi/i.test(id) ? 262144 : /^qwen3\.6-plus$/i.test(id) ? 1048576 : 131072;
+  const isVision = isVisionModel(id);
+  const isReasoning = isReasoningModel(id);
   return {
     id,
     name: prettyName(id),
     reasoning: isReasoning,
     input: isVision ? ["text", "image"] : ["text"],
-    contextWindow: ctxMatch,
+    contextWindow: inferContextWindow(id),
     maxTokens: openaiOnly ? 16384 : 65536,
     compat: isReasoning ? { thinkingFormat: "qwen" } : undefined,
     openaiOnly,
@@ -157,16 +177,15 @@ async function fetchCloudModels(domain: string, apiKey: string, _force = false):
     const models = json.data
       .filter((m) => !exclude.test(m.id))
       .map((m) => {
-        const isVision = /vl|vision/i.test(m.id);
-        const isReasoning = /qwq|max|thinking|deepseek|minimax|kimi|glm|3\.6|3\.5/i.test(m.id);
-        const contextWindow = /^qwen3\.6-plus$/i.test(m.id) ? 1048576 : 128000;
+        const isVision = isVisionModel(m.id);
+        const isReasoning = isReasoningModel(m.id);
         return {
           id: m.id,
           name: m.name || m.id,
           reasoning: isReasoning,
           input: isVision ? (["text", "image"] as ("text" | "image")[]) : (["text"] as ("text" | "image")[]),
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow,
+          contextWindow: inferContextWindow(m.id),
           maxTokens: 8192,
           compat: isReasoning ? { thinkingFormat: "qwen" as const } : undefined,
         };
