@@ -21,11 +21,15 @@ This is a forked version of [`Fornace/pi-alibaba-models`](https://github.com/For
 ## Install this fork
 
 ```bash
-git clone git@github.com:nathannli/pi-alibaba-models.git
-cd pi-alibaba-models
-
 # Remove an existing install first, if present.
 pi remove pi-alibaba-models || true
+
+# from GitHub
+pi install git:github.com/Fornace/pi-alibaba-models
+
+# from local
+git clone git@github.com:nathannli/pi-alibaba-models.git
+cd pi-alibaba-models
 
 # Install from this local checkout.
 pi install "$(pwd)"
