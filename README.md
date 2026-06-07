@@ -115,7 +115,8 @@ Cached at `~/.pi/agent/alibaba-plan-models.cache.json` for **4 hours**. The live
 - **DeepSeek Compatibility**: The Anthropic-compatible path on the Alibaba Plan host often hangs or times out for DeepSeek models. To resolve this seamlessly, this extension automatically forces any model ID containing `deepseek` to use the **OpenAI-completions endpoint** instead.
 - **Model Availability (404s)**: The model picker displays the universally *advertised* catalog. However, if your specific Alibaba Cloud account or Model Studio subscription tier does not include access to a specific model, the API will return a `model_not_found` error only when you actually attempt to send a message.
 - **API Wrapper Quirks**: Alibaba's native Anthropic compatibility layer can occasionally be strict or quirky with complex parallel tool calls. If you experience systemic parsing errors on DashScope, you can use the `/alibaba` command to switch your Cloud API format to "OpenAI".
-- **Dynamic Caching**: Model lists are cached for 48 hours. If a new model drops and you don't see it, run `/alibaba` -> `Refresh model lists`.
+- **Dynamic Caching**: Model lists are cached for 4 hours. If a new model drops and you don't see it, run `/alibaba` -> `Refresh model lists`.
+- **Inferred Context Windows**: The `/v1/models` API returns only ids and names, so context windows are inferred from the model id. If a brand-new model shows the wrong size, fix it yourself with `/alibaba → Context Window — Override` (per model, or `*` for all) — no extension update needed.
 
 ## `/alibaba` command reference
 
@@ -128,6 +129,7 @@ Cached at `~/.pi/agent/alibaba-plan-models.cache.json` for **4 hours**. The live
 | Plan — Change Endpoints      | Override OpenAI / Anthropic base URLs                                    |
 | Cloud — Change Domain        | International / China / Custom domain                                    |
 | Cloud — Change API Format    | Switch between Anthropic-compat and OpenAI-compat                        |
+| Context Window — Override    | Set the context-window shown on a model's card (per model, or `*` for all) |
 | Reset all                    | Wipe all Alibaba state (config, both auth entries, plan-models cache)    |
 
 ## Troubleshooting

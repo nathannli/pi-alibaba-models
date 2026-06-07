@@ -22,6 +22,11 @@ interface AlibabaConfig {
   planAnthropic?: string;
   cloudDomain?: string;
   cloudApiFormat?: "anthropic-messages" | "openai-completions";
+  // Override the context-window shown on a model's card in the picker.
+  // Keyed by exact model id (e.g. "qwen3.7-plus"); the special key "*" applies
+  // to every model that has no explicit entry. Values are token counts.
+  // Useful when the inferred size is wrong for a brand-new model.
+  contextWindowOverrides?: Record<string, number>;
 }
 
 const readJSON = <T>(p: string, fallback: T): T => {
@@ -58,7 +63,10 @@ const isVisionModel = (id: string): boolean =>
 const isReasoningModel = (id: string): boolean =>
   /qwq|max|thinking|deepseek|minimax|kimi|glm|3\.[5-9]/i.test(id);
 
-const inferContextWindow = (id: string): number => {
+const inferContextWindow = (id: string, overrides?: Record<string, number>): number => {
+  // User overrides win: exact id first, then the "*" catch-all.
+  const o = overrides?.[id] ?? overrides?.["*"];
+  if (typeof o === "number" && o > 0) return o;
   if (/flash/i.test(id)) return 131072;
   if (/kimi/i.test(id)) return 262144;
   if (/^qwen3\.6-max\b/i.test(id)) return 262144; // 3.6 Max = 256K
@@ -68,7 +76,7 @@ const inferContextWindow = (id: string): number => {
 };
 
 // Heuristic: turn a bare model id (from /v1/models API) into a full PlanModelDef.
-function inferPlanDef(id: string): PlanModelDef {
+function inferPlanDef(id: string, overrides?: Record<string, number>): PlanModelDef {
   const openaiOnly = /deepseek/i.test(id);
   const isVision = isVisionModel(id);
   const isReasoning = isReasoningModel(id);
@@ -77,7 +85,7 @@ function inferPlanDef(id: string): PlanModelDef {
     name: prettyName(id),
     reasoning: isReasoning,
     input: isVision ? ["text", "image"] : ["text"],
-    contextWindow: inferContextWindow(id),
+    contextWindow: inferContextWindow(id, overrides),
     maxTokens: openaiOnly ? 16384 : 65536,
     compat: isReasoning ? { thinkingFormat: "qwen" } : undefined,
     openaiOnly,
@@ -101,9 +109,10 @@ async function fetchPlanModelsFromAPI(credentials?: { access?: string; refresh?:
     if (!json.data?.length) throw new Error("No models in response");
     // Filter out image/audio/etc — only keep chat-capable models.
     const exclude = /(image|audio|video|tts|asr|embed|vector|rerank|wan|omni|livetranslate|realtime)/i;
+    const overrides = loadConfig().contextWindowOverrides;
     return json.data
       .filter((m) => !exclude.test(m.id))
-      .map((m) => inferPlanDef(m.id));
+      .map((m) => inferPlanDef(m.id, overrides));
   } finally { clearTimeout(t); }
 }
 
@@ -174,6 +183,7 @@ async function fetchCloudModels(domain: string, apiKey: string, _force = false):
     if (!json.data?.length) throw new Error("No models");
     // Filter out non-LLMs (image, audio, video, embedding, etc.) — we only want chat models.
     const exclude = /(image|audio|video|tts|asr|embed|vector|rerank|wan|omni|livetranslate|realtime)/i;
+    const overrides = loadConfig().contextWindowOverrides;
     const models = json.data
       .filter((m) => !exclude.test(m.id))
       .map((m) => {
@@ -185,7 +195,7 @@ async function fetchCloudModels(domain: string, apiKey: string, _force = false):
           reasoning: isReasoning,
           input: isVision ? (["text", "image"] as ("text" | "image")[]) : (["text"] as ("text" | "image")[]),
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: inferContextWindow(m.id),
+          contextWindow: inferContextWindow(m.id, overrides),
           maxTokens: 8192,
           compat: isReasoning ? { thinkingFormat: "qwen" as const } : undefined,
         };
@@ -207,6 +217,23 @@ function buildCloudModels(models: ProviderModelConfig[], domain: string, fmt: st
     };
   });
 }
+
+// ── Cloud login seed ─────────────────────────────────────────────────
+// pi hides any provider that has zero registered models, so before the
+// user logs in the Cloud provider would vanish from /login → "Use an API
+// key" (see issue #1). To stay visible we register ONE real, always-present
+// DashScope model whenever the live catalog is empty. This is a single
+// login seed — not a model-catalog fallback — and the live catalog replaces
+// it the moment the user logs in.
+const CLOUD_LOGIN_SEED: ProviderModelConfig[] = [{
+  id: "qwen-plus",
+  name: "Qwen Plus",
+  reasoning: false,
+  input: ["text"],
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  contextWindow: 131072,
+  maxTokens: 8192,
+}];
 
 // ── Offline-resilient catalog loaders ────────────────────────────────
 // Live API is the source of truth. But a network failure must never take
@@ -349,6 +376,8 @@ export default async function (pi: ExtensionAPI) {
 
   if (planCreds?.access) planDefs = await loadPlanDefs(true, planCreds);
   if (cloudKey) cloudDefs = await loadCloudDefs(cloudDomain, cloudKey, true);
+  // Keep the Cloud provider visible in /login even with no models yet (issue #1).
+  if (!cloudDefs.length) cloudDefs = CLOUD_LOGIN_SEED;
 
   // ── Plan provider ───────────────────────────────────────────────────
   pi.registerProvider("alibaba-plan", {
@@ -420,6 +449,8 @@ export default async function (pi: ExtensionAPI) {
       const domain = cfg.cloudDomain || DEFAULT_CLOUD_DOMAIN;
       cloudDefs = await loadCloudDefs(domain, key, false);
     }
+    // Keep the Cloud provider visible in /login even with no models yet (issue #1).
+    if (!cloudDefs.length) cloudDefs = CLOUD_LOGIN_SEED;
 
     // Re-register both providers with the expanded model lists
     const currentConfig = loadConfig();
@@ -498,6 +529,7 @@ export default async function (pi: ExtensionAPI) {
         "Plan — Change Endpoints",
         "Cloud — Change Domain",
         "Cloud — Change API Format",
+        "Context Window — Override",
         "Reset all",
       ]);
       if (!choice) return;
@@ -528,8 +560,15 @@ export default async function (pi: ExtensionAPI) {
           `       Domain:    ${cfg.cloudDomain || DEFAULT_CLOUD_DOMAIN}`,
           `       Format:    ${cfg.cloudApiFormat || "anthropic-messages"}`,
           `       Models:    ${cloudDefs.length} (${cloudState})`,
-        ].join("\n");
-        ctx.ui.notify(lines, "info");
+        ];
+        const overrides = cfg.contextWindowOverrides;
+        if (overrides && Object.keys(overrides).length) {
+          lines.push("", "Context window overrides:");
+          for (const [id, n] of Object.entries(overrides)) {
+            lines.push(`       ${id}: ${n.toLocaleString()} tokens`);
+          }
+        }
+        ctx.ui.notify(lines.join("\n"), "info");
         return;
       }
 
@@ -615,6 +654,60 @@ export default async function (pi: ExtensionAPI) {
         cfg.cloudApiFormat = sel.startsWith("OpenAI") ? "openai-completions" : "anthropic-messages";
         saveConfig(cfg);
         ctx.ui.notify(`Cloud format: ${cfg.cloudApiFormat}`, "info");
+        await ctx.reload();
+        return;
+      }
+
+      if (choice === "Context Window — Override") {
+        // Override the context-window shown on a model's card (e.g. when the
+        // inferred size is wrong for a brand-new model). Pick a model id, or
+        // "*" to set a default for every model without its own override.
+        const ov = cfg.contextWindowOverrides || {};
+        const fmt = (n: number) => n.toLocaleString();
+        const ids = Array.from(new Set([...planDefs.map((m) => m.id), ...cloudDefs.map((m) => m.id)])).sort();
+        const labelToId = new Map<string, string>();
+        const opts: string[] = [];
+        for (const id of ids) {
+          const label = ov[id] ? `${id}  (override: ${fmt(ov[id])})` : id;
+          labelToId.set(label, id);
+          opts.push(label);
+        }
+        const allLabel = ov["*"] ? `* every other model  (override: ${fmt(ov["*"])})` : "* every other model";
+        labelToId.set(allLabel, "*");
+        opts.push(allLabel);
+        const CLEAR = "Clear all overrides";
+        opts.push(CLEAR);
+
+        const sel = await ctx.ui.select("Override context window for:", opts);
+        if (!sel) return;
+        if (sel === CLEAR) {
+          delete cfg.contextWindowOverrides;
+          saveConfig(cfg);
+          ctx.ui.notify("Cleared all context-window overrides.", "info");
+          await ctx.reload();
+          return;
+        }
+        const id = labelToId.get(sel) ?? sel;
+        const current = ov[id];
+        const val = (await ctx.ui.input(
+          `Context window for ${id} in tokens — e.g. 1048576 (0 to remove)${current ? `; currently ${fmt(current)}` : ""}:`,
+        ))?.trim();
+        if (!val) return; // cancelled / left blank → no change
+        const n = Number(val.replace(/[_,\s]/g, ""));
+        if (!Number.isFinite(n) || n < 0) {
+          ctx.ui.notify("Enter a non-negative number of tokens (0 removes the override).", "error");
+          return;
+        }
+        cfg.contextWindowOverrides = cfg.contextWindowOverrides || {};
+        if (n === 0) {
+          delete cfg.contextWindowOverrides[id];
+          ctx.ui.notify(`Removed context-window override for ${id}.`, "info");
+        } else {
+          cfg.contextWindowOverrides[id] = Math.floor(n);
+          ctx.ui.notify(`Context window for ${id} set to ${fmt(Math.floor(n))} tokens.`, "info");
+        }
+        if (Object.keys(cfg.contextWindowOverrides).length === 0) delete cfg.contextWindowOverrides;
+        saveConfig(cfg);
         await ctx.reload();
         return;
       }
