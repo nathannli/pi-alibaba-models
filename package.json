@@ -41,6 +41,7 @@
   "files": [
     "extensions/**/*.ts",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "pi": {
