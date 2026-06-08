@@ -218,13 +218,32 @@ function buildCloudModels(models: ProviderModelConfig[], domain: string, fmt: st
   });
 }
 
+// ── Cloud credential resolution ──────────────────────────────────────
+// The Cloud provider can authenticate either from a key saved via /login
+// (auth.json) OR from the DASHSCOPE_API_KEY env var (its apiKey is
+// "$DASHSCOPE_API_KEY"). Either one lets us fetch the real catalog — so we
+// always prefer the live list and only fall back to the login seed below
+// when there is no credential at all.
+const readCloudKey = (): string | null => {
+  try {
+    const c = readAuth()["alibaba-cloud"];
+    const k = c?.key || c?.access;
+    if (k) return k;
+  } catch {}
+  return process.env.DASHSCOPE_API_KEY || null;
+};
+
 // ── Cloud login seed ─────────────────────────────────────────────────
-// pi hides any provider that has zero registered models, so before the
-// user logs in the Cloud provider would vanish from /login → "Use an API
-// key" (see issue #1). To stay visible we register ONE real, always-present
-// DashScope model whenever the live catalog is empty. This is a single
-// login seed — not a model-catalog fallback — and the live catalog replaces
-// it the moment the user logs in.
+// pi hides any provider that has zero registered models, so with no
+// credential at all the Cloud provider would vanish from /login → "Use an
+// API key" (issue #1). To stay visible we register ONE placeholder model
+// when — and only when — the live catalog is empty AND no key exists. In
+// that state no model is usable anyway (there's no key), so this is purely a
+// "click here to log in" entry, not a model-catalog fallback: as soon as a
+// key is present (via /login or $DASHSCOPE_API_KEY) the live catalog is
+// fetched and replaces it. We use a real, region-agnostic id (`qwen-plus`,
+// present on every DashScope account) so it also works for an env-var user
+// before the first refresh, and never lingers as an orphan after login.
 const CLOUD_LOGIN_SEED: ProviderModelConfig[] = [{
   id: "qwen-plus",
   name: "Qwen Plus",
@@ -360,12 +379,11 @@ export default async function (pi: ExtensionAPI) {
   const config = loadConfig();
 
   let planKey: string | null = null;
-  let cloudKey: string | null = null;
   try {
     const auth = readAuth();
     planKey = auth["alibaba-plan"]?.access || auth["alibaba-plan"]?.key || null;
-    cloudKey = auth["alibaba-cloud"]?.key || auth["alibaba-cloud"]?.access || null;
   } catch {}
+  const cloudKey = readCloudKey();
 
   // ── Live catalog fetch (before provider registration) ───────────────
   let planCreds: { access?: string; refresh?: string } | undefined;
@@ -442,8 +460,7 @@ export default async function (pi: ExtensionAPI) {
     const planCred = readAuth()["alibaba-plan"];
     planDefs = await loadPlanDefs(false, planCred);
 
-    const auth = readAuth();
-    const key = auth["alibaba-cloud"]?.key || auth["alibaba-cloud"]?.access;
+    const key = readCloudKey();
     if (key) {
       const cfg = loadConfig();
       const domain = cfg.cloudDomain || DEFAULT_CLOUD_DOMAIN;
@@ -556,7 +573,7 @@ export default async function (pi: ExtensionAPI) {
           `       OpenAI:    ${ep.openai}`,
           `       Models:    ${planDefs.length} (${planState})`,
           ``,
-          `Cloud: ${cloudCred ? "logged in" : "not logged in"}`,
+          `Cloud: ${cloudCred ? "logged in" : (process.env.DASHSCOPE_API_KEY ? "via $DASHSCOPE_API_KEY" : "not logged in")}`,
           `       Domain:    ${cfg.cloudDomain || DEFAULT_CLOUD_DOMAIN}`,
           `       Format:    ${cfg.cloudApiFormat || "anthropic-messages"}`,
           `       Models:    ${cloudDefs.length} (${cloudState})`,
