@@ -4,10 +4,46 @@ The complete [`pi`](https://github.com/badlogic/pi-mono) extension for Alibaba's
 
 ## Fork notice
 
-This is a forked version of [`Fornace/pi-alibaba-models`](https://github.com/Fornace/pi-alibaba-models) with local fixes for current `pi` provider registration, Alibaba Cloud API-key login, Cloud region selection, and live model catalog cleanup.
+This is a forked version of [`Fornace/pi-alibaba-models`](https://github.com/Fornace/pi-alibaba-models) with local fixes for current `pi` provider registration, Alibaba Cloud API-key login, Cloud region selection, live model catalog cleanup, and `models.dev` metadata enrichment.
 
 ## Fork feature changelog
 
+Differences from upstream [`Fornace/pi-alibaba-models`](https://github.com/Fornace/pi-alibaba-models) `main`:
+
+### Live catalog metadata
+
+- **models.dev enrichment** — Plan and Cloud still use Alibaba's authenticated `/models` endpoints as the source of truth for account/domain availability, then enrich those live ids with [`models.dev`](https://models.dev/api.json) metadata.
+- **Context windows and output limits** — Model cards use `models.dev` `limit.context` / `limit.output` before falling back to local heuristics.
+- **Token costs** — `models.dev` token costs are mapped to pi's `cost.input`, `cost.output`, `cost.cacheRead`, and `cost.cacheWrite` fields.
+- **Modalities and reasoning** — `models.dev` supplies display name, image-input support, and reasoning flags where available.
+- **Metadata cache fallback** — Alibaba model lists and `models.dev` metadata are cached separately. If live fetches fail, cached Plan/Cloud lists are rehydrated with the newest available metadata before registration.
+- User overrides via `/alibaba → Context Window — Override` still win over `models.dev` context values.
+
+### Cloud regions
+
+`/alibaba → Cloud — Change Domain` adds regional presets beyond upstream's International + China:
+
+| Preset | Domain |
+|--------|--------|
+| Singapore | `{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com` |
+| US (Virginia) | `dashscope-us.aliyuncs.com` |
+| China (Beijing) | `dashscope.aliyuncs.com` |
+| China (Hong Kong) | `{WorkspaceId}.cn-hongkong.maas.aliyuncs.com` |
+| Germany (Frankfurt) | `{WorkspaceId}.eu-central-1.maas.aliyuncs.com` |
+| Custom | user-entered domain |
+
+Workspace-scoped presets prompt for a Workspace ID and substitute it into the domain.
+
+### Model list filtering
+
+After Alibaba `GET /compatible-mode/v1/models`, this fork keeps the live ids that look usable for chat:
+
+1. **Not a non-LLM** — id does not match `image`, `audio`, `video`, `tts`, `asr`, `embed`, `vector`, `rerank`, `wan`, `omni`, `livetranslate`, or `realtime`.
+2. **Not a dated snapshot** — id does not contain a `-YYYY-MM-DD` suffix (e.g. `qwen3.7-plus-2026-05-26`).
+3. **Text in / text out** — when `models.dev` metadata exists, input and output modalities must include `text`.
+4. **Not deprecated / non-tool** — when `models.dev` marks a model as deprecated or `tool_call: false`, it is skipped.
+
+The picker is always **Alibaba live availability enriched by `models.dev` metadata**. `models.dev` does not add models by itself; it only supplies context, output, cost, modality, reasoning, and display metadata for ids returned by the authenticated Alibaba endpoint.
 - Fixed DashScope env-var registration for newer `pi` versions by using `$DASHSCOPE_API_KEY`.
 - Registered Alibaba Cloud as an API-key provider while keeping the provider id `alibaba-cloud` and display name `Alibaba Cloud (API Key)`.
 - Added fallback Cloud models so `/login → Use an API key → Alibaba Cloud (API Key)` appears before credentials or a live catalog exist.
