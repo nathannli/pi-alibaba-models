@@ -9,6 +9,7 @@ const CONFIG_PATH = path.join(HOME_DIR, "alibaba-config.json");
 const AUTH_PATH = path.join(HOME_DIR, "auth.json");
 const PLAN_CACHE_PATH = path.join(HOME_DIR, "alibaba-plan-models.cache.json");
 const CLOUD_CACHE_PATH = path.join(HOME_DIR, "alibaba-cloud-models.cache.json");
+const MODELS_DEV_CACHE_PATH = path.join(HOME_DIR, "alibaba-models-dev.cache.json");
 
 const MODELS_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
 
@@ -45,52 +46,189 @@ const writeAuth = (a: Record<string, any>) => writeJSON(AUTH_PATH, a);
 // Anthropic-compatible by default; deepseek forced to openai-completions.
 interface PlanModelDef {
   id: string; name: string; reasoning: boolean; contextWindow: number; maxTokens: number;
-  input: ("text" | "image")[]; compat?: { thinkingFormat: "qwen" }; openaiOnly?: boolean;
+  input: ("text" | "image")[]; cost?: ProviderModelConfig["cost"];
+  compat?: { thinkingFormat: "qwen" }; openaiOnly?: boolean;
 }
 
 // ── Plan model fetch + parse + cache ──────────────────────────────────
 interface PlanCache { fetchedAt: number; source: string; models: PlanModelDef[]; }
 
-const hasDateSuffix = (id: string) => /-\d{4}-\d{2}-\d{2}(?:-|$)/.test(id);
+// ── models.dev metadata + capability fallbacks ───────────────────────
+// Alibaba /models endpoints are the source of truth for account availability,
+// but they only return ids/names. models.dev supplies context windows, output
+// limits, costs, modalities, and reasoning flags for those live ids.
+interface ModelsDevModel {
+  id: string;
+  name?: string;
+  tool_call?: boolean;
+  reasoning?: boolean;
+  status?: string;
+  limit?: { context?: number; output?: number };
+  cost?: { input?: number; output?: number; cache_read?: number; cache_write?: number };
+  modalities?: { input?: string[]; output?: string[] };
+}
+interface ModelsDevProvider { id?: string; name?: string; api?: string; models?: Record<string, ModelsDevModel>; }
+interface ModelsDevCache { fetchedAt: number; providers: Record<string, ModelsDevProvider>; }
 
-// ── Capability heuristics (shared by Plan + Cloud) ───────────────────
-// The /models API only returns ids/names, not capabilities — so context
-// window, reasoning, and vision are inferred from the id. Both the Plan
-// and Cloud code paths route through these helpers so they never drift
-// apart. Context windows reflect Alibaba's published specs as of June 2026
-// and are corrected here as new models ship.
+type ModelsDevSource = "live" | "cache" | "unavailable";
+let modelsDevCatalog: Record<string, ModelsDevProvider> = {};
+let modelsDevSource: ModelsDevSource = "unavailable";
+let modelsDevFetchedAt = 0;
+
+const ALIBABA_MODELS_DEV_KEYS = [
+  "alibaba", "alibaba-cn", "alibaba-coding-plan", "alibaba-token-plan", "alibaba-coding-plan-cn",
+];
+const EXCLUDE_NON_CHAT = /(image|audio|video|tts|asr|embed|vector|rerank|wan|omni|livetranslate|realtime)/i;
+
 const isVisionModel = (id: string): boolean =>
   /vl|vision/i.test(id) || /^qwen3\.\d+-plus\b/i.test(id) || /kimi/i.test(id);
 
 const isReasoningModel = (id: string): boolean =>
   /qwq|max|thinking|deepseek|minimax|kimi|glm|3\.[5-9]/i.test(id);
 
-const inferContextWindow = (id: string, overrides?: Record<string, number>): number => {
-  // User overrides win: exact id first, then the "*" catch-all.
-  const o = overrides?.[id] ?? overrides?.["*"];
-  if (typeof o === "number" && o > 0) return o;
+const hasDateSuffix = (id: string) => /-\d{4}-\d{2}-\d{2}(?:-|$)/.test(id);
+
+async function loadModelsDevCatalog(): Promise<void> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 5000);
+  try {
+    const res = await fetch("https://models.dev/api.json", { signal: ctrl.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json() as Record<string, ModelsDevProvider>;
+    const providers = Object.fromEntries(
+      ALIBABA_MODELS_DEV_KEYS.filter((k) => json[k]?.models).map((k) => [k, json[k]]),
+    ) as Record<string, ModelsDevProvider>;
+    if (!Object.keys(providers).length) throw new Error("No Alibaba providers in models.dev response");
+    modelsDevCatalog = providers;
+    modelsDevSource = "live";
+    modelsDevFetchedAt = Date.now();
+    writeJSON(MODELS_DEV_CACHE_PATH, { fetchedAt: modelsDevFetchedAt, providers } satisfies ModelsDevCache);
+  } catch (e: any) {
+    const cache = readJSON<ModelsDevCache | null>(MODELS_DEV_CACHE_PATH, null);
+    if (cache?.providers && Object.keys(cache.providers).length) {
+      modelsDevCatalog = cache.providers;
+      modelsDevSource = "cache";
+      modelsDevFetchedAt = cache.fetchedAt;
+      console.warn(`[alibaba] models.dev fetch failed (${e?.message || e}); using cached metadata (${Math.round((Date.now() - cache.fetchedAt) / 60000)}m old).`);
+    } else {
+      modelsDevCatalog = {};
+      modelsDevSource = "unavailable";
+      modelsDevFetchedAt = 0;
+      console.warn(`[alibaba] models.dev fetch failed (${e?.message || e}); using local capability fallbacks.`);
+    }
+  } finally { clearTimeout(t); }
+}
+
+function planModelsDevKey(credentials?: { access?: string; refresh?: string }): string {
+  const ep = resolvePlanEndpoints(credentials).openai;
+  if (/coding\.dashscope\.aliyuncs\.com/i.test(ep)) return "alibaba-coding-plan-cn";
+  if (/coding/i.test(ep)) return "alibaba-coding-plan";
+  return "alibaba-token-plan";
+}
+
+function cloudModelsDevKey(domain: string): string {
+  return /^dashscope\.aliyuncs\.com$/i.test(domain) ? "alibaba-cn" : "alibaba";
+}
+
+function getModelsDevModel(providerKey: string, id: string): ModelsDevModel | undefined {
+  const models = modelsDevCatalog[providerKey]?.models;
+  if (!models) return undefined;
+  if (models[id]) return models[id];
+  const lower = id.toLowerCase();
+  return Object.entries(models).find(([k]) => k.toLowerCase() === lower)?.[1];
+}
+
+function modelInput(meta: ModelsDevModel | undefined, id: string): ("text" | "image")[] {
+  if (meta?.modalities?.input) return meta.modalities.input.includes("image") ? ["text", "image"] : ["text"];
+  return isVisionModel(id) ? ["text", "image"] : ["text"];
+}
+
+function modelCost(meta: ModelsDevModel | undefined): ProviderModelConfig["cost"] {
+  return {
+    input: meta?.cost?.input || 0,
+    output: meta?.cost?.output || 0,
+    cacheRead: meta?.cost?.cache_read || 0,
+    cacheWrite: meta?.cost?.cache_write || 0,
+  };
+}
+
+function fallbackContextWindow(id: string): number {
   if (/flash/i.test(id)) return 131072;
   if (/kimi/i.test(id)) return 262144;
   if (/^qwen3\.6-max\b/i.test(id)) return 262144; // 3.6 Max = 256K
-  // 3.6 Plus and every 3.7+ Plus/Max ship a 1M context window.
   if (/^qwen3\.6-plus\b/i.test(id) || /^qwen3\.([7-9]|\d{2,})-(plus|max)\b/i.test(id)) return 1048576;
   return 131072;
+}
+
+const inferContextWindow = (id: string, overrides?: Record<string, number>, meta?: ModelsDevModel): number => {
+  // User overrides win: exact id first, then the "*" catch-all.
+  const o = overrides?.[id] ?? overrides?.["*"];
+  if (typeof o === "number" && o > 0) return o;
+  if (typeof meta?.limit?.context === "number" && meta.limit.context > 0) return meta.limit.context;
+  return fallbackContextWindow(id);
 };
 
-// Heuristic: turn a bare model id (from /v1/models API) into a full PlanModelDef.
-function inferPlanDef(id: string, overrides?: Record<string, number>): PlanModelDef {
+function includeLiveChatModel(id: string, meta?: ModelsDevModel): boolean {
+  if (hasDateSuffix(id)) return false;
+  if (meta) {
+    if (meta.status === "deprecated") return false;
+    if (meta.modalities) {
+      const input = meta.modalities.input || [];
+      const output = meta.modalities.output || [];
+      if (!input.includes("text") || !output.includes("text")) return false;
+    }
+    if (meta.tool_call === false) return false;
+  }
+  return !EXCLUDE_NON_CHAT.test(id);
+}
+
+// Turn a bare live model id into a full PlanModelDef, enriched by models.dev.
+function inferPlanDef(id: string, providerKey: string, overrides?: Record<string, number>): PlanModelDef {
+  const meta = getModelsDevModel(providerKey, id);
   const openaiOnly = /deepseek/i.test(id);
-  const isVision = isVisionModel(id);
-  const isReasoning = isReasoningModel(id);
+  const isReasoning = meta?.reasoning === true || (!meta && isReasoningModel(id));
   return {
     id,
-    name: prettyName(id),
+    name: meta?.name || prettyName(id),
     reasoning: isReasoning,
-    input: isVision ? ["text", "image"] : ["text"],
-    contextWindow: inferContextWindow(id, overrides),
-    maxTokens: openaiOnly ? 16384 : 65536,
+    input: modelInput(meta, id),
+    contextWindow: inferContextWindow(id, overrides, meta),
+    maxTokens: meta?.limit?.output || (openaiOnly ? 16384 : 65536),
+    cost: modelCost(meta),
     compat: isReasoning ? { thinkingFormat: "qwen" } : undefined,
     openaiOnly,
+  };
+}
+
+function enrichPlanDef(m: PlanModelDef, providerKey: string, overrides?: Record<string, number>): PlanModelDef {
+  const meta = getModelsDevModel(providerKey, m.id);
+  if (!meta) return { ...m, contextWindow: inferContextWindow(m.id, overrides) };
+  const reasoning = meta.reasoning === true;
+  return {
+    ...m,
+    name: meta.name || m.name,
+    reasoning,
+    input: modelInput(meta, m.id),
+    contextWindow: inferContextWindow(m.id, overrides, meta),
+    maxTokens: meta.limit?.output || m.maxTokens,
+    cost: modelCost(meta),
+    compat: reasoning ? { thinkingFormat: "qwen" } : undefined,
+  };
+}
+
+function enrichProviderModel(m: ProviderModelConfig, providerKey: string, overrides?: Record<string, number>): ProviderModelConfig {
+  const meta = getModelsDevModel(providerKey, m.id);
+  if (!meta) return { ...m, contextWindow: inferContextWindow(m.id, overrides) };
+  const reasoning = meta.reasoning === true;
+  return {
+    ...m,
+    name: meta.name || m.name,
+    reasoning,
+    input: modelInput(meta, m.id),
+    cost: modelCost(meta),
+    contextWindow: inferContextWindow(m.id, overrides, meta),
+    maxTokens: meta.limit?.output || m.maxTokens,
+    compat: reasoning ? { thinkingFormat: "qwen" as const } : undefined,
   };
 }
 
@@ -109,12 +247,11 @@ async function fetchPlanModelsFromAPI(credentials?: { access?: string; refresh?:
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const json = (await res.json()) as { data?: { id: string }[] };
     if (!json.data?.length) throw new Error("No models in response");
-    // Filter out image/audio/etc and dated variants — only keep canonical chat models.
-    const exclude = /(image|audio|video|tts|asr|embed|vector|rerank|wan|omni|livetranslate|realtime)/i;
     const overrides = loadConfig().contextWindowOverrides;
+    const providerKey = planModelsDevKey(credentials);
     return json.data
-      .filter((m) => !exclude.test(m.id) && !hasDateSuffix(m.id))
-      .map((m) => inferPlanDef(m.id, overrides));
+      .filter((m) => includeLiveChatModel(m.id, getModelsDevModel(providerKey, m.id)))
+      .map((m) => inferPlanDef(m.id, providerKey, overrides));
   } finally { clearTimeout(t); }
 }
 
@@ -162,7 +299,7 @@ function buildPlanModels(defs: PlanModelDef[], openaiUrl: string, anthropicUrl: 
       id: m.id, name: m.name, reasoning: m.reasoning, input: m.input,
       contextWindow: m.contextWindow, maxTokens: m.maxTokens, compat: m.compat,
       thinkingLevelMap: m.reasoning ? { off: null } : undefined,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      cost: m.cost || { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       baseUrl: useOpenAI ? openaiUrl : anthropicUrl,
       api: (useOpenAI ? "openai-completions" : "anthropic-messages") as "anthropic-messages" | "openai-completions",
     };
@@ -183,22 +320,21 @@ async function fetchCloudModels(domain: string, apiKey: string, _force = false):
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const json = (await res.json()) as { data?: { id: string; name?: string }[] };
     if (!json.data?.length) throw new Error("No models");
-    // Filter out non-LLMs (image, audio, video, embedding, etc.) — we only want chat models.
-    const exclude = /(image|audio|video|tts|asr|embed|vector|rerank|wan|omni|livetranslate|realtime)/i;
     const overrides = loadConfig().contextWindowOverrides;
+    const providerKey = cloudModelsDevKey(domain);
     const models = json.data
-      .filter((m) => !exclude.test(m.id) && !hasDateSuffix(m.id))
+      .filter((m) => includeLiveChatModel(m.id, getModelsDevModel(providerKey, m.id)))
       .map((m) => {
-        const isVision = isVisionModel(m.id);
-        const isReasoning = isReasoningModel(m.id);
+        const meta = getModelsDevModel(providerKey, m.id);
+        const isReasoning = meta?.reasoning === true || (!meta && isReasoningModel(m.id));
         return {
           id: m.id,
-          name: m.name || m.id,
+          name: meta?.name || m.name || m.id,
           reasoning: isReasoning,
-          input: isVision ? (["text", "image"] as ("text" | "image")[]) : (["text"] as ("text" | "image")[]),
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: inferContextWindow(m.id, overrides),
-          maxTokens: 8192,
+          input: modelInput(meta, m.id),
+          cost: modelCost(meta),
+          contextWindow: inferContextWindow(m.id, overrides, meta),
+          maxTokens: meta?.limit?.output || 8192,
           compat: isReasoning ? { thinkingFormat: "qwen" as const } : undefined,
         };
       });
@@ -209,11 +345,14 @@ async function fetchCloudModels(domain: string, apiKey: string, _force = false):
 }
 
 function buildCloudModels(models: ProviderModelConfig[], domain: string, fmt: string): ProviderModelConfig[] {
-  return models.filter((m) => !hasDateSuffix(m.id)).map((m) => {
-    const useOpenAI = /deepseek/i.test(m.id) || fmt === "openai-completions";
+  const overrides = loadConfig().contextWindowOverrides;
+  const providerKey = cloudModelsDevKey(domain);
+  return models.filter((m) => includeLiveChatModel(m.id, getModelsDevModel(providerKey, m.id))).map((m) => {
+    const enriched = enrichProviderModel(m, providerKey, overrides);
+    const useOpenAI = /deepseek/i.test(enriched.id) || fmt === "openai-completions";
     return {
-      ...m,
-      thinkingLevelMap: m.reasoning ? { off: null } : undefined,
+      ...enriched,
+      thinkingLevelMap: enriched.reasoning ? { off: null } : undefined,
       baseUrl: useOpenAI ? `https://${domain}/compatible-mode/v1` : `https://${domain}/apps/anthropic`,
       api: (useOpenAI ? "openai-completions" : "anthropic-messages") as "anthropic-messages" | "openai-completions",
     };
@@ -252,7 +391,7 @@ const CLOUD_LOGIN_SEED: ProviderModelConfig[] = [{
   reasoning: false,
   input: ["text"],
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-  contextWindow: 131072,
+  contextWindow: inferContextWindow("qwen-plus"),
   maxTokens: 8192,
 }];
 
@@ -271,8 +410,15 @@ async function loadPlanDefs(force: boolean, credentials?: { access?: string; ref
   } catch (e: any) {
     const cache = readJSON<PlanCache | null>(PLAN_CACHE_PATH, null);
     if (cache?.models?.length) {
-      console.warn(`[alibaba] Plan catalog fetch failed (${e?.message || e}); using cached models (${cache.models.length}, ${cacheAgeMin(cache.fetchedAt)}m old).`);
-      return cache.models;
+      const overrides = loadConfig().contextWindowOverrides;
+      const providerKey = planModelsDevKey(credentials);
+      const cachedModels = cache.models
+        .filter((m) => includeLiveChatModel(m.id, getModelsDevModel(providerKey, m.id)))
+        .map((m) => enrichPlanDef(m, providerKey, overrides));
+      if (cachedModels.length) {
+        console.warn(`[alibaba] Plan catalog fetch failed (${e?.message || e}); using cached models (${cachedModels.length}, ${cacheAgeMin(cache.fetchedAt)}m old).`);
+        return cachedModels;
+      }
     }
     console.warn(`[alibaba] Plan catalog fetch failed (${e?.message || e}); no cache — Plan models unavailable until reconnected. Other providers still work.`);
     return [];
@@ -285,8 +431,15 @@ async function loadCloudDefs(domain: string, apiKey: string, force: boolean): Pr
   } catch (e: any) {
     const cache = readJSON<CloudCache | null>(CLOUD_CACHE_PATH, null);
     if (cache?.models?.length && cache.domain === domain) {
-      console.warn(`[alibaba] Cloud catalog fetch failed (${e?.message || e}); using cached models (${cache.models.length}, ${cacheAgeMin(cache.fetchedAt)}m old).`);
-      return cache.models;
+      const overrides = loadConfig().contextWindowOverrides;
+      const providerKey = cloudModelsDevKey(domain);
+      const cachedModels = cache.models
+        .filter((m) => includeLiveChatModel(m.id, getModelsDevModel(providerKey, m.id)))
+        .map((m) => enrichProviderModel(m, providerKey, overrides));
+      if (cachedModels.length) {
+        console.warn(`[alibaba] Cloud catalog fetch failed (${e?.message || e}); using cached models (${cachedModels.length}, ${cacheAgeMin(cache.fetchedAt)}m old).`);
+        return cachedModels;
+      }
     }
     console.warn(`[alibaba] Cloud catalog fetch failed (${e?.message || e}); no cache — Cloud models unavailable until reconnected. Other providers still work.`);
     return [];
@@ -394,6 +547,7 @@ export default async function (pi: ExtensionAPI) {
   const cloudDomain = config.cloudDomain || DEFAULT_CLOUD_DOMAIN;
   const cloudFmt = config.cloudApiFormat || "anthropic-messages";
 
+  await loadModelsDevCatalog();
   if (planCreds?.access) planDefs = await loadPlanDefs(true, planCreds);
   if (cloudKey) cloudDefs = await loadCloudDefs(cloudDomain, cloudKey, true);
   // Keep the Cloud provider visible in /login even with no models yet (issue #1).
@@ -459,6 +613,7 @@ export default async function (pi: ExtensionAPI) {
   // ── Lazy refresh: fetch live catalogs and re-register ───────────────
   pi.on("session_start", async () => {
    try {
+    await loadModelsDevCatalog();
     const planCred = readAuth()["alibaba-plan"];
     planDefs = await loadPlanDefs(false, planCred);
 
@@ -565,6 +720,9 @@ export default async function (pi: ExtensionAPI) {
         const ageMin = (c: { fetchedAt: number } | null) => c ? Math.round((Date.now() - c.fetchedAt) / 60000) : null;
         const planAge = ageMin(planCache);
         const cloudAge = ageMin(cloudCache);
+        const metadataState = modelsDevSource === "unavailable"
+          ? "unavailable, using fallbacks"
+          : `models.dev ${modelsDevSource}, ${Math.round((Date.now() - modelsDevFetchedAt) / 60000)}m old`;
         const isPlanLive = planCache && planAge !== null && planCache.models.length === planDefs.length;
         const isCloudLive = cloudCache && cloudAge !== null && cloudCache.models.length === cloudDefs.length;
         const planState = isPlanLive ? `live, ${planAge}m old` : (planDefs.length ? "live, not cached" : "not fetched");
@@ -579,6 +737,8 @@ export default async function (pi: ExtensionAPI) {
           `       Domain:    ${cfg.cloudDomain || DEFAULT_CLOUD_DOMAIN}`,
           `       Format:    ${cfg.cloudApiFormat || "anthropic-messages"}`,
           `       Models:    ${cloudDefs.length} (${cloudState})`,
+          ``,
+          `Metadata: ${metadataState}`,
         ];
         const overrides = cfg.contextWindowOverrides;
         if (overrides && Object.keys(overrides).length) {
@@ -593,6 +753,7 @@ export default async function (pi: ExtensionAPI) {
 
       if (choice === "Refresh model lists") {
         try {
+          await loadModelsDevCatalog();
           const planCred = readAuth()["alibaba-plan"];
           planDefs = await fetchPlanModels(true, planCred);
           let cloudCount = 0;
@@ -744,9 +905,9 @@ export default async function (pi: ExtensionAPI) {
       if (choice === "Reset all") {
         if (!await ctx.ui.confirm(
           "Reset all Alibaba settings?",
-          "Wipes config, both auth entries, plan-models cache, and any alibaba-* entries in settings.json (enabledModels + defaultProvider/defaultModel if alibaba). Run before `pi remove` for a clean uninstall.",
+          "Wipes config, both auth entries, model caches, and any alibaba-* entries in settings.json (enabledModels + defaultProvider/defaultModel if alibaba). Run before `pi remove` for a clean uninstall.",
         )) return;
-        for (const p of [CONFIG_PATH, PLAN_CACHE_PATH, CLOUD_CACHE_PATH]) { try { fs.unlinkSync(p); } catch {} }
+        for (const p of [CONFIG_PATH, PLAN_CACHE_PATH, CLOUD_CACHE_PATH, MODELS_DEV_CACHE_PATH]) { try { fs.unlinkSync(p); } catch {} }
         // Use authStorage.remove() so pi's in-memory credential cache stays in sync —
         // otherwise /login's "• configured" label persists until pi is restarted.
         for (const k of ["alibaba", "alibaba-plan", "alibaba-cloud", "alibaba-studio", "alibaba-token", "dashscope"]) {
