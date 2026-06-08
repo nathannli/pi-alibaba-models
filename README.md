@@ -12,7 +12,7 @@ Differences from upstream [`Fornace/pi-alibaba-models`](https://github.com/Forna
 
 ### Live catalog metadata
 
-- **models.dev enrichment** — Plan and Cloud still use Alibaba's authenticated `/models` endpoints as the source of truth for account/domain availability, then enrich those live ids with [`models.dev`](https://models.dev/api.json) metadata.
+- **models.dev enrichment** — Plan and Cloud still use Alibaba's authenticated `/models` endpoints as the source of truth for account/domain availability, then enrich those live ids with [`models.dev`](https://github.com/anomalyco/models.dev) metadata.
 - **Context windows and output limits** — Model cards use `models.dev` `limit.context` / `limit.output` before falling back to local heuristics.
 - **Token costs** — `models.dev` token costs are mapped to pi's `cost.input`, `cost.output`, `cost.cacheRead`, and `cost.cacheWrite` fields.
 - **Modalities and reasoning** — `models.dev` supplies display name, image-input support, and reasoning flags where available.
