@@ -50,24 +50,92 @@ const writeAuth = (a: Record<string, any>) => writeJSON(AUTH_PATH, a);
 interface PlanModelDef {
   id: string; name: string; reasoning: boolean; contextWindow: number; maxTokens: number;
   input: ("text" | "image")[]; compat?: { thinkingFormat: "qwen" }; openaiOnly?: boolean;
+  cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
 }
 
 // ── Models.dev registry cache ───────────────────────────────────────────
-interface ModelsDevCache { fetchedAt: number; modelIds: Set<string>; }
+interface ModelsDevEntry {
+  contextWindow: number;
+  maxOutput: number;
+  inputPrice: number; // per token
+  outputPrice: number; // per token
+  reasoning: boolean;
+}
+
+interface ModelsDevCache { 
+  fetchedAt: number; 
+  models: Map<string, ModelsDevEntry>; 
+}
 
 let modelsDevCache: ModelsDevCache | null = null;
 
-async function fetchModelsDevRegistry(): Promise<Set<string>> {
+function parseModelsDevHTML(html: string): Map<string, ModelsDevEntry> {
+  const models = new Map<string, ModelsDevEntry>();
+  
+  // Find all model IDs with alibaba/ prefix
+  const modelIdPattern = /alibaba\/([a-z0-9.-]+)/gi;
+  const processedIds = new Set<string>();
+  
+  let match;
+  while ((match = modelIdPattern.exec(html)) !== null) {
+    const modelId = match[1].toLowerCase();
+    
+    // Skip if already processed
+    if (processedIds.has(modelId)) continue;
+    processedIds.add(modelId);
+    
+    // Extract context around this match to parse data fields
+    const startPos = match.index;
+    const context = html.substring(startPos, startPos + 1500);
+    
+    // Extract context window (first number with commas after model ID)
+    const contextMatch = context.match(/(\d{1,3}(?:,\d{3})+)/);
+    const contextWindow = contextMatch ? parseInt(contextMatch[1].replace(/,/g, '')) : 131072;
+    
+    // Extract output tokens (second number with commas)
+    const numberMatches = Array.from(context.matchAll(/(\d{1,3}(?:,\d{3})+)/g));
+    const maxOutput = numberMatches.length > 1 ? parseInt(numberMatches[1][1].replace(/,/g, '')) : 8192;
+    
+    // Extract price ($X.XX / $X.XX format - per 1M tokens)
+    const priceMatch = context.match(/\$([\d.]+)\s*\/?\s*\$([\d.]+)/);
+    let inputPrice = 0;
+    let outputPrice = 0;
+    if (priceMatch) {
+      // Convert from per-1M-tokens to per-token
+      inputPrice = parseFloat(priceMatch[1]) / 1_000_000;
+      outputPrice = parseFloat(priceMatch[2]) / 1_000_000;
+    }
+    
+    // Extract reasoning flag (Yes appears after price)
+    const reasoningMatch = context.match(/\$[\d.]+\s*\/?\s*\$[\d.]+[^>]*?>(Yes|No)</i);
+    const reasoning = reasoningMatch ? reasoningMatch[1].toLowerCase() === 'yes' : false;
+    
+    models.set(modelId, {
+      contextWindow,
+      maxOutput,
+      inputPrice,
+      outputPrice,
+      reasoning,
+    });
+  }
+  
+  return models;
+}
+
+async function fetchModelsDevRegistry(): Promise<Map<string, ModelsDevEntry>> {
   // Return cached version if fresh
   if (modelsDevCache && Date.now() - modelsDevCache.fetchedAt < MODELS_DEV_CACHE_TTL_MS) {
-    return modelsDevCache.modelIds;
+    return modelsDevCache.models;
   }
 
   // Try to load from disk cache
-  const diskCache = readJSON<{ fetchedAt: number; modelIds: string[] } | null>(MODELS_DEV_CACHE_PATH, null);
+  const diskCache = readJSON<{ fetchedAt: number; models: Array<[string, ModelsDevEntry]> } | null>(MODELS_DEV_CACHE_PATH, null);
   if (diskCache && Date.now() - diskCache.fetchedAt < MODELS_DEV_CACHE_TTL_MS) {
-    modelsDevCache = { fetchedAt: diskCache.fetchedAt, modelIds: new Set(diskCache.modelIds) };
-    return modelsDevCache.modelIds;
+    modelsDevCache = { 
+      fetchedAt: diskCache.fetchedAt, 
+      models: new Map(diskCache.models) 
+    };
+    return modelsDevCache.models;
   }
 
   // Fetch from models.dev
@@ -80,30 +148,24 @@ async function fetchModelsDevRegistry(): Promise<Set<string>> {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const html = await res.text();
     
-    // Parse model IDs from the HTML - they appear in table rows as "alibaba/model-id"
-    const modelIdRegex = /alibaba\/([a-z0-9.-]+)/gi;
-    const modelIds = new Set<string>();
-    let match;
-    while ((match = modelIdRegex.exec(html)) !== null) {
-      modelIds.add(match[1]); // Store without the "alibaba/" prefix
-    }
+    // Parse the table to extract model data
+    const models = parseModelsDevHTML(html);
     
-    if (modelIds.size === 0) {
+    if (models.size === 0) {
       throw new Error("No models found in models.dev response");
     }
     
     // Cache to memory and disk
-    modelsDevCache = { fetchedAt: Date.now(), modelIds };
+    modelsDevCache = { fetchedAt: Date.now(), models };
     writeJSON(MODELS_DEV_CACHE_PATH, {
       fetchedAt: modelsDevCache.fetchedAt,
-      modelIds: Array.from(modelIds),
+      models: Array.from(models.entries()),
     });
     
-    return modelIds;
+    return models;
   } catch (e: any) {
-    console.warn(`[alibaba] Failed to fetch models.dev registry (${e?.message || e}); skipping filter.`);
-    // Return empty set on failure - caller should handle gracefully
-    return new Set();
+    console.warn(`[alibaba] Failed to fetch models.dev registry (${e?.message || e}); skipping enrichment.`);
+    return new Map();
   }
 }
 
@@ -146,17 +208,30 @@ const inferContextWindow = (id: string, overrides?: Record<string, number>): num
 };
 
 // Heuristic: turn a bare model id (from /v1/models API) into a full PlanModelDef.
-function inferPlanDef(id: string, overrides?: Record<string, number>): PlanModelDef {
+function inferPlanDef(id: string, overrides?: Record<string, number>, devEntry?: ModelsDevEntry): PlanModelDef {
   const openaiOnly = /deepseek/i.test(id);
   const isVision = isVisionModel(id);
-  const isReasoning = isReasoningModel(id);
+  // Prefer models.dev reasoning flag if available, fall back to heuristic
+  const isReasoning = devEntry ? devEntry.reasoning : isReasoningModel(id);
+  
+  // Prefer models.dev data, fall back to heuristics and overrides
+  const contextWindow = devEntry ? devEntry.contextWindow : inferContextWindow(id, overrides);
+  const maxTokens = devEntry ? devEntry.maxOutput : (openaiOnly ? 16384 : 65536);
+  const cost = devEntry ? {
+    input: devEntry.inputPrice,
+    output: devEntry.outputPrice,
+    cacheRead: 0,
+    cacheWrite: 0,
+  } : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  
   return {
     id,
     name: prettyName(id),
     reasoning: isReasoning,
     input: isVision ? ["text", "image"] : ["text"],
-    contextWindow: inferContextWindow(id, overrides),
-    maxTokens: openaiOnly ? 16384 : 65536,
+    contextWindow,
+    maxTokens,
+    cost,
     compat: isReasoning ? { thinkingFormat: "qwen" } : undefined,
     openaiOnly,
   };
@@ -181,12 +256,13 @@ async function fetchPlanModelsFromAPI(credentials?: { access?: string; refresh?:
     const exclude = /(image|audio|video|tts|asr|embed|vector|rerank|wan|omni|livetranslate|realtime)/i;
     const overrides = loadConfig().contextWindowOverrides;
     
-    // Filter against models.dev registry
-    const validModels = await fetchModelsDevRegistry();
-    return json.data
+    // Filter against models.dev registry and enrich with its data
+    const registry = await fetchModelsDevRegistry();
+    const filteredModels = json.data
       .filter((m) => !exclude.test(m.id))
-      .filter((m) => validModels.size === 0 || validModels.has(m.id))
-      .map((m) => inferPlanDef(m.id, overrides));
+      .filter((m) => registry.size === 0 || registry.has(m.id)); // Allow all if registry fetch failed
+    
+    return filteredModels.map((m) => inferPlanDef(m.id, overrides, registry.get(m.id)));
   } finally { clearTimeout(t); }
 }
 
@@ -234,7 +310,7 @@ function buildPlanModels(defs: PlanModelDef[], openaiUrl: string, anthropicUrl: 
       id: m.id, name: m.name, reasoning: m.reasoning, input: m.input,
       contextWindow: m.contextWindow, maxTokens: m.maxTokens, compat: m.compat,
       thinkingLevelMap: m.reasoning ? { off: null } : undefined,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      cost: m.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       baseUrl: useOpenAI ? openaiUrl : anthropicUrl,
       api: (useOpenAI ? "openai-completions" : "anthropic-messages") as "anthropic-messages" | "openai-completions",
     };
@@ -259,23 +335,35 @@ async function fetchCloudModels(domain: string, apiKey: string, _force = false):
     const exclude = /(image|audio|video|tts|asr|embed|vector|rerank|wan|omni|livetranslate|realtime)/i;
     const overrides = loadConfig().contextWindowOverrides;
     
-    // Filter against models.dev registry
-    const validModels = await fetchModelsDevRegistry();
+    // Filter against models.dev registry and enrich with its data
+    const registry = await fetchModelsDevRegistry();
     
     const models = json.data
       .filter((m) => !exclude.test(m.id))
-      .filter((m) => validModels.size === 0 || validModels.has(m.id))
+      .filter((m) => registry.size === 0 || registry.has(m.id)) // Allow all if registry fetch failed
       .map((m) => {
+        const devEntry = registry.get(m.id);
         const isVision = isVisionModel(m.id);
-        const isReasoning = isReasoningModel(m.id);
+        // Prefer models.dev reasoning flag if available, fall back to heuristic
+        const isReasoning = devEntry ? devEntry.reasoning : isReasoningModel(m.id);
+        // Prefer models.dev data, fall back to heuristics
+        const contextWindow = devEntry ? devEntry.contextWindow : inferContextWindow(m.id, overrides);
+        const maxTokens = devEntry ? devEntry.maxOutput : 8192;
+        const cost = devEntry ? {
+          input: devEntry.inputPrice,
+          output: devEntry.outputPrice,
+          cacheRead: 0,
+          cacheWrite: 0,
+        } : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+        
         return {
           id: m.id,
           name: m.name || m.id,
           reasoning: isReasoning,
           input: isVision ? (["text", "image"] as ("text" | "image")[]) : (["text"] as ("text" | "image")[]),
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: inferContextWindow(m.id, overrides),
-          maxTokens: 8192,
+          cost,
+          contextWindow,
+          maxTokens,
           compat: isReasoning ? { thinkingFormat: "qwen" as const } : undefined,
         };
       });
@@ -681,18 +769,20 @@ export default async function (pi: ExtensionAPI) {
       if (choice === "Refresh model lists") {
         try {
           const planCred = readAuth()["alibaba-plan"];
-          planDefs = await fetchPlanModels(true, planCred);
+          planDefs = await loadPlanDefs(true, planCred);
           let cloudCount = 0;
-          if (cloudCred?.key || cloudCred?.access) {
+          const cloudKey = readCloudKey();
+          if (cloudKey) {
             const domain = cfg.cloudDomain || DEFAULT_CLOUD_DOMAIN;
-            const key = cloudCred.key || cloudCred.access;
-            cloudDefs = await fetchCloudModels(domain, key, true);
+            cloudDefs = await loadCloudDefs(domain, cloudKey, true);
             cloudCount = cloudDefs.length;
           }
-          ctx.ui.notify(`Plan: ${planDefs.length} models. Cloud: ${cloudCount > 0 ? `${cloudCount} models` : "skipped (not logged in)"}.`, "info");
           await ctx.reload();
+          ctx.ui.notify(`Plan: ${planDefs.length} models. Cloud: ${cloudKey ? `${cloudCount} models` : "skipped (not logged in)"}.`, "info");
         } catch (e: any) {
-          ctx.ui.notify(`Failed: ${e?.message || e}`, "error");
+          const message = e?.message || String(e);
+          console.error(`[alibaba] Refresh model lists failed: ${message}`);
+          ctx.ui.notify(`Refresh failed: ${message}. Full error was logged to the terminal.`, "error");
         }
         return;
       }
