@@ -16,6 +16,10 @@ const DEFAULT_PLAN_OPENAI = "https://token-plan.ap-southeast-1.maas.aliyuncs.com
 const DEFAULT_PLAN_ANTHROPIC = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
 const DEFAULT_CLOUD_DOMAIN = "dashscope-intl.aliyuncs.com";
 
+const MODELS_DEV_API_URL = "https://models.dev/providers/alibaba";
+const MODELS_DEV_CACHE_PATH = path.join(HOME_DIR, "alibaba-models-dev.cache.json");
+const MODELS_DEV_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
 // ── Config / auth helpers ─────────────────────────────────────────────
 interface AlibabaConfig {
   planOpenAI?: string;
@@ -46,6 +50,61 @@ const writeAuth = (a: Record<string, any>) => writeJSON(AUTH_PATH, a);
 interface PlanModelDef {
   id: string; name: string; reasoning: boolean; contextWindow: number; maxTokens: number;
   input: ("text" | "image")[]; compat?: { thinkingFormat: "qwen" }; openaiOnly?: boolean;
+}
+
+// ── Models.dev registry cache ───────────────────────────────────────────
+interface ModelsDevCache { fetchedAt: number; modelIds: Set<string>; }
+
+let modelsDevCache: ModelsDevCache | null = null;
+
+async function fetchModelsDevRegistry(): Promise<Set<string>> {
+  // Return cached version if fresh
+  if (modelsDevCache && Date.now() - modelsDevCache.fetchedAt < MODELS_DEV_CACHE_TTL_MS) {
+    return modelsDevCache.modelIds;
+  }
+
+  // Try to load from disk cache
+  const diskCache = readJSON<{ fetchedAt: number; modelIds: string[] } | null>(MODELS_DEV_CACHE_PATH, null);
+  if (diskCache && Date.now() - diskCache.fetchedAt < MODELS_DEV_CACHE_TTL_MS) {
+    modelsDevCache = { fetchedAt: diskCache.fetchedAt, modelIds: new Set(diskCache.modelIds) };
+    return modelsDevCache.modelIds;
+  }
+
+  // Fetch from models.dev
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 5000);
+    const res = await fetch(MODELS_DEV_API_URL, { signal: ctrl.signal });
+    clearTimeout(t);
+    
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const html = await res.text();
+    
+    // Parse model IDs from the HTML - they appear in table rows as "alibaba/model-id"
+    const modelIdRegex = /alibaba\/([a-z0-9.-]+)/gi;
+    const modelIds = new Set<string>();
+    let match;
+    while ((match = modelIdRegex.exec(html)) !== null) {
+      modelIds.add(match[1]); // Store without the "alibaba/" prefix
+    }
+    
+    if (modelIds.size === 0) {
+      throw new Error("No models found in models.dev response");
+    }
+    
+    // Cache to memory and disk
+    modelsDevCache = { fetchedAt: Date.now(), modelIds };
+    writeJSON(MODELS_DEV_CACHE_PATH, {
+      fetchedAt: modelsDevCache.fetchedAt,
+      modelIds: Array.from(modelIds),
+    });
+    
+    return modelIds;
+  } catch (e: any) {
+    console.warn(`[alibaba] Failed to fetch models.dev registry (${e?.message || e}); skipping filter.`);
+    // Return empty set on failure - caller should handle gracefully
+    return new Set();
+  }
 }
 
 // ── Plan model fetch + parse + cache ──────────────────────────────────
@@ -110,8 +169,12 @@ async function fetchPlanModelsFromAPI(credentials?: { access?: string; refresh?:
     // Filter out image/audio/etc — only keep chat-capable models.
     const exclude = /(image|audio|video|tts|asr|embed|vector|rerank|wan|omni|livetranslate|realtime)/i;
     const overrides = loadConfig().contextWindowOverrides;
+    
+    // Filter against models.dev registry
+    const validModels = await fetchModelsDevRegistry();
     return json.data
       .filter((m) => !exclude.test(m.id))
+      .filter((m) => validModels.size === 0 || validModels.has(m.id))
       .map((m) => inferPlanDef(m.id, overrides));
   } finally { clearTimeout(t); }
 }
@@ -184,8 +247,13 @@ async function fetchCloudModels(domain: string, apiKey: string, _force = false):
     // Filter out non-LLMs (image, audio, video, embedding, etc.) — we only want chat models.
     const exclude = /(image|audio|video|tts|asr|embed|vector|rerank|wan|omni|livetranslate|realtime)/i;
     const overrides = loadConfig().contextWindowOverrides;
+    
+    // Filter against models.dev registry
+    const validModels = await fetchModelsDevRegistry();
+    
     const models = json.data
       .filter((m) => !exclude.test(m.id))
+      .filter((m) => validModels.size === 0 || validModels.has(m.id))
       .map((m) => {
         const isVision = isVisionModel(m.id);
         const isReasoning = isReasoningModel(m.id);
@@ -732,9 +800,9 @@ export default async function (pi: ExtensionAPI) {
       if (choice === "Reset all") {
         if (!await ctx.ui.confirm(
           "Reset all Alibaba settings?",
-          "Wipes config, both auth entries, plan-models cache, and any alibaba-* entries in settings.json (enabledModels + defaultProvider/defaultModel if alibaba). Run before `pi remove` for a clean uninstall.",
+          "Wipes config, both auth entries, plan-models cache, cloud-models cache, models.dev cache, and any alibaba-* entries in settings.json (enabledModels + defaultProvider/defaultModel if alibaba). Run before `pi remove` for a clean uninstall.",
         )) return;
-        for (const p of [CONFIG_PATH, PLAN_CACHE_PATH, CLOUD_CACHE_PATH]) { try { fs.unlinkSync(p); } catch {} }
+        for (const p of [CONFIG_PATH, PLAN_CACHE_PATH, CLOUD_CACHE_PATH, MODELS_DEV_CACHE_PATH]) { try { fs.unlinkSync(p); } catch {} }
         // Use authStorage.remove() so pi's in-memory credential cache stays in sync —
         // otherwise /login's "• configured" label persists until pi is restarted.
         for (const k of ["alibaba", "alibaba-plan", "alibaba-cloud", "alibaba-studio", "alibaba-token", "dashscope"]) {
