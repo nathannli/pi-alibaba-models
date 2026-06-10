@@ -16,7 +16,7 @@ const DEFAULT_PLAN_OPENAI = "https://token-plan.ap-southeast-1.maas.aliyuncs.com
 const DEFAULT_PLAN_ANTHROPIC = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
 const DEFAULT_CLOUD_DOMAIN = "dashscope-intl.aliyuncs.com";
 
-const MODELS_DEV_API_URL = "https://models.dev/providers/alibaba";
+const MODELS_DEV_API_URL = "https://models.dev/api.json";
 const MODELS_DEV_CACHE_PATH = path.join(HOME_DIR, "alibaba-models-dev.cache.json");
 const MODELS_DEV_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -60,6 +60,7 @@ interface ModelsDevEntry {
   inputPrice: number; // per token
   outputPrice: number; // per token
   reasoning: boolean;
+  attachment?: boolean; // vision/image support
 }
 
 interface ModelsDevCache { 
@@ -69,53 +70,22 @@ interface ModelsDevCache {
 
 let modelsDevCache: ModelsDevCache | null = null;
 
-function parseModelsDevHTML(html: string): Map<string, ModelsDevEntry> {
+function parseModelsDevJSON(json: any): Map<string, ModelsDevEntry> {
   const models = new Map<string, ModelsDevEntry>();
   
-  // Find all model IDs with alibaba/ prefix
-  const modelIdPattern = /alibaba\/([a-z0-9.-]+)/gi;
-  const processedIds = new Set<string>();
+  const alibabaProvider = json?.alibaba;
+  if (!alibabaProvider?.models) {
+    return models;
+  }
   
-  let match;
-  while ((match = modelIdPattern.exec(html)) !== null) {
-    const modelId = match[1].toLowerCase();
-    
-    // Skip if already processed
-    if (processedIds.has(modelId)) continue;
-    processedIds.add(modelId);
-    
-    // Extract context around this match to parse data fields
-    const startPos = match.index;
-    const context = html.substring(startPos, startPos + 1500);
-    
-    // Extract context window (first number with commas after model ID)
-    const contextMatch = context.match(/(\d{1,3}(?:,\d{3})+)/);
-    const contextWindow = contextMatch ? parseInt(contextMatch[1].replace(/,/g, '')) : 131072;
-    
-    // Extract output tokens (second number with commas)
-    const numberMatches = Array.from(context.matchAll(/(\d{1,3}(?:,\d{3})+)/g));
-    const maxOutput = numberMatches.length > 1 ? parseInt(numberMatches[1][1].replace(/,/g, '')) : 8192;
-    
-    // Extract price ($X.XX / $X.XX format - per 1M tokens)
-    const priceMatch = context.match(/\$([\d.]+)\s*\/?\s*\$([\d.]+)/);
-    let inputPrice = 0;
-    let outputPrice = 0;
-    if (priceMatch) {
-      // Convert from per-1M-tokens to per-token
-      inputPrice = parseFloat(priceMatch[1]) / 1_000_000;
-      outputPrice = parseFloat(priceMatch[2]) / 1_000_000;
-    }
-    
-    // Extract reasoning flag (Yes appears after price)
-    const reasoningMatch = context.match(/\$[\d.]+\s*\/?\s*\$[\d.]+[^>]*?>(Yes|No)</i);
-    const reasoning = reasoningMatch ? reasoningMatch[1].toLowerCase() === 'yes' : false;
-    
+  for (const [modelId, modelData] of Object.entries(alibabaProvider.models) as [string, any][]) {
     models.set(modelId, {
-      contextWindow,
-      maxOutput,
-      inputPrice,
-      outputPrice,
-      reasoning,
+      contextWindow: modelData?.limit?.context || 131072,
+      maxOutput: modelData?.limit?.output || 8192,
+      inputPrice: modelData?.cost?.input || 0,
+      outputPrice: modelData?.cost?.output || 0,
+      reasoning: modelData?.reasoning || false,
+      attachment: modelData?.attachment || false,
     });
   }
   
@@ -146,10 +116,10 @@ async function fetchModelsDevRegistry(): Promise<Map<string, ModelsDevEntry>> {
     clearTimeout(t);
     
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const html = await res.text();
+    const json = await res.json();
     
-    // Parse the table to extract model data
-    const models = parseModelsDevHTML(html);
+    // Parse the JSON to extract model data
+    const models = parseModelsDevJSON(json);
     
     if (models.size === 0) {
       throw new Error("No models found in models.dev response");
@@ -173,6 +143,10 @@ async function fetchModelsDevRegistry(): Promise<Map<string, ModelsDevEntry>> {
 interface PlanCache { fetchedAt: number; source: string; models: PlanModelDef[]; }
 
 // ── Capability heuristics (shared by Plan + Cloud) ───────────────────
+// Filter out dated model variants (e.g., qwen3.7-max-20250125)
+const isDateSuffixed = (id: string): boolean =>
+  /-\d{8}$/.test(id) || /-\d{4}-\d{2}-\d{2}$/.test(id);
+
 // The /models API only returns ids/names, not capabilities — so context
 // window, reasoning, and vision are inferred from the id. Both the Plan
 // and Cloud code paths route through these helpers so they never drift
@@ -199,7 +173,8 @@ const inferContextWindow = (id: string, overrides?: Record<string, number>): num
 // Heuristic: turn a bare model id (from /v1/models API) into a full PlanModelDef.
 function inferPlanDef(id: string, overrides?: Record<string, number>, devEntry?: ModelsDevEntry): PlanModelDef {
   const openaiOnly = /deepseek/i.test(id);
-  const isVision = isVisionModel(id);
+  // Use models.dev attachment field if available, fall back to heuristic
+  const isVision = devEntry?.attachment === true || isVisionModel(id);
   // Prefer models.dev reasoning flag if available, fall back to heuristic
   const isReasoning = devEntry ? devEntry.reasoning : isReasoningModel(id);
   
@@ -249,7 +224,8 @@ async function fetchPlanModelsFromAPI(credentials?: { access?: string; refresh?:
     const registry = await fetchModelsDevRegistry();
     const filteredModels = json.data
       .filter((m) => !exclude.test(m.id))
-      .filter((m) => registry.size === 0 || registry.has(m.id)); // Allow all if registry fetch failed
+      .filter((m) => !isDateSuffixed(m.id)) // Always filter date-suffixed variants
+      .filter((m) => registry.size === 0 || registry.has(m.id)); // Allowlist when registry available
     
     return filteredModels.map((m) => inferPlanDef(m.id, overrides, registry.get(m.id)));
   } finally { clearTimeout(t); }
@@ -329,10 +305,12 @@ async function fetchCloudModels(domain: string, apiKey: string, _force = false):
     
     const models = json.data
       .filter((m) => !exclude.test(m.id))
-      .filter((m) => registry.size === 0 || registry.has(m.id)) // Allow all if registry fetch failed
+      .filter((m) => !isDateSuffixed(m.id)) // Always filter date-suffixed variants
+      .filter((m) => registry.size === 0 || registry.has(m.id)) // Allowlist when registry available
       .map((m) => {
         const devEntry = registry.get(m.id);
-        const isVision = isVisionModel(m.id);
+        // Use models.dev attachment field if available, fall back to heuristic
+        const isVision = devEntry?.attachment === true || isVisionModel(m.id);
         // Prefer models.dev reasoning flag if available, fall back to heuristic
         const isReasoning = devEntry ? devEntry.reasoning : isReasoningModel(m.id);
         // Prefer models.dev data, fall back to heuristics
