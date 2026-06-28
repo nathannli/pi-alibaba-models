@@ -108,6 +108,47 @@ type AuthEntry = {
 	expires?: number;
 };
 
+type CredentialResolver = {
+	get?: (provider: string) => AuthEntry | undefined;
+	peekApiKey?: (provider: string) => Promise<string | undefined>;
+};
+
+// pi resolves "$ENV_VAR"; oh-my-pi expects bare "ENV_VAR" (see ProviderConfig docs).
+const formatProviderApiKeyConfig = (envName: string, omp: boolean): string =>
+	omp ? envName : `$${envName}`;
+
+const DASHSCOPE_CONSOLE_URL: Record<CloudProviderId, string> = {
+	alibaba: "https://dashscope.console.aliyun.com/apiKey",
+	"alibaba-cn": "https://dashscope.console.aliyun.com/apiKey",
+	"alibaba-global":
+		"https://modelstudio.console.aliyun.com/us-east-1/?tab=globalkey#/api-key",
+};
+
+
+const credentialResolver = (authStorage: {
+	get: (provider: string) => AuthEntry | undefined;
+	peekApiKey?: (provider: string) => Promise<string | undefined>;
+}): CredentialResolver => ({
+	get: (provider) => authStorage.get(provider),
+	peekApiKey: authStorage.peekApiKey?.bind(authStorage),
+});
+const getPlanCreds = (
+	resolver?: CredentialResolver,
+): { access?: string; refresh?: string } | undefined => {
+	if (resolver?.get) {
+		const cred = resolver.get("alibaba-plan");
+		if (!cred) return undefined;
+		if (cred.key) return { access: cred.key, refresh: cred.refresh };
+		if (cred.access) return { access: cred.access, refresh: cred.refresh };
+		return undefined;
+	}
+	try {
+		return readAuth()["alibaba-plan"];
+	} catch {
+		return undefined;
+	}
+};
+
 const readJSON = <T>(p: string, fallback: T): T => {
 	try {
 		return JSON.parse(fs.readFileSync(p, "utf8")) as T;
@@ -634,14 +675,20 @@ function buildCloudModels(
 	});
 }
 
-const createCloudOAuth = (provider: CloudProviderDef) => ({
+const createCloudOAuth = (provider: CloudProviderDef, omp: boolean) => ({
 	name: provider.name,
 	async login(callbacks: {
+		onAuth?: (info: { url: string; instructions?: string }) => void;
 		onPrompt: (prompt: { message: string; placeholder?: string }) => Promise<string>;
 	}) {
+		callbacks.onAuth?.({
+			url: DASHSCOPE_CONSOLE_URL[provider.id],
+			instructions: `Create or copy a DashScope API key for ${provider.name}.`,
+		});
 		const key = (
 			await callbacks.onPrompt({
 				message: `DashScope API key for ${provider.name} (sk-…). Not a Coding Plan token (sk-sp-… / sk-tok-…).`,
+				placeholder: "sk-...",
 			})
 		).trim();
 		if (!key) throw new Error("API key required");
@@ -650,40 +697,44 @@ const createCloudOAuth = (provider: CloudProviderDef) => ({
 				"This looks like a Coding Plan token. Run /login → Alibaba Model Studio Coding Plan instead.",
 			);
 		}
+		if (omp) return key;
 		return {
 			access: key,
 			refresh: key,
 			expires: Date.now() + 365 * 86400_000,
 		};
 	},
-	async refreshToken(c: { access: string; refresh?: string; expires?: number }) {
-		return {
-			...c,
-			refresh: c.refresh ?? c.access,
-			expires: c.expires ?? Date.now() + 365 * 86400_000,
-		};
-	},
-	getApiKey(c: { access: string }) {
-		return c.access;
-	},
+	...(omp
+		? {}
+		: {
+				async refreshToken(c: {
+					access: string;
+					refresh?: string;
+					expires?: number;
+				}) {
+					return {
+						...c,
+						refresh: c.refresh ?? c.access,
+						expires: c.expires ?? Date.now() + 365 * 86400_000,
+					};
+				},
+				getApiKey(c: { access: string }) {
+					return c.access;
+				},
+			}),
 });
 
-const fetchCloudCatalog = async (
+const fetchCloudCatalogFromCache = (
 	provider: CloudProviderDef,
 	apiKey: string | undefined,
 	fmt: string,
-): Promise<ProviderModelConfig[]> => {
+): ProviderModelConfig[] => {
 	if (!apiKey) return CLOUD_LOGIN_SEED;
-	try {
-		const models = await loadCloudDefs(provider, apiKey, false);
-		return buildCloudModels(ensureCloudLoginSeed(models), provider, fmt);
-	} catch {
-		const cache = readJSON<CloudCache | null>(provider.cachePath, null);
-		if (cache?.models?.length && cache.domain === provider.domain) {
-			return buildCloudModels(cache.models, provider, fmt);
-		}
-		return CLOUD_LOGIN_SEED;
+	const cached = loadCloudDefsFromCache(provider);
+	if (cached.length) {
+		return buildCloudModels(cached, provider, fmt);
 	}
+	return CLOUD_LOGIN_SEED;
 };
 
 function registerCloudProviders(
@@ -696,16 +747,16 @@ function registerCloudProviders(
 		const base = {
 			name: provider.name,
 			baseUrl: `https://${provider.domain}/apps/anthropic`,
-			apiKey: `$${provider.apiKeyEnv}`,
+			apiKey: formatProviderApiKeyConfig(provider.apiKeyEnv, omp),
 			api: "anthropic-messages" as const,
 			authHeader: true,
 		};
 		if (omp) {
 			pi.registerProvider(provider.id, {
 				...base,
-				oauth: createCloudOAuth(provider),
-				fetchDynamicModels: (apiKey: string | undefined) =>
-					fetchCloudCatalog(provider, apiKey, fmt),
+				oauth: createCloudOAuth(provider, omp),
+				fetchDynamicModels: async (apiKey: string | undefined) =>
+					fetchCloudCatalogFromCache(provider, apiKey, fmt),
 			} as unknown as OmpProviderConfig);
 		} else {
 			pi.registerProvider(provider.id, {
@@ -721,14 +772,30 @@ function registerCloudProviders(
 // (auth.json) OR from its matching DASHSCOPE_* env var. Either one lets us
 // fetch the real catalog — so we always prefer the live list and only fall
 // back to the login seed below when there is no credential at all.
-const readCloudKey = (provider: CloudProviderDef): string | null => {
-	try {
-		const c = readAuth()[provider.id];
-		const k = c?.key || c?.access;
+async function resolveCloudKey(
+	provider: CloudProviderDef,
+	resolver?: CredentialResolver,
+): Promise<string | null> {
+	if (resolver?.peekApiKey) {
+		try {
+			const key = await resolver.peekApiKey(provider.id);
+			if (key && key !== "N/A") return key;
+		} catch {}
+	}
+	if (resolver?.get) {
+		const cred = resolver.get?.(provider.id);
+		const k = cred?.key || cred?.access;
 		if (k) return k;
-	} catch {}
+	}
+	if (!resolver) {
+		try {
+			const c = readAuth()[provider.id];
+			const k = c?.key || c?.access;
+			if (k) return k;
+		} catch {}
+	}
 	return process.env[provider.apiKeyEnv] || null;
-};
+}
 
 // ── Cloud login seed ─────────────────────────────────────────────────
 // pi hides any provider that has zero registered models, so with no
@@ -761,6 +828,37 @@ const CLOUD_LOGIN_SEED: ProviderModelConfig[] = [
 // is reachable, its response always wins and overwrites the cache.
 const cacheAgeMin = (fetchedAt: number) =>
 	Math.round((Date.now() - fetchedAt) / 60000);
+
+function loadPlanDefsFromCache(): PlanModelDef[] {
+	const cache = readJSON<PlanCache | null>(getPlanCachePath(), null);
+	return cache?.models ?? [];
+}
+
+function loadCloudDefsFromCache(provider: CloudProviderDef): ProviderModelConfig[] {
+	const cache = readJSON<CloudCache | null>(provider.cachePath, null);
+	if (cache?.models?.length && cache.domain === provider.domain) {
+		return cache.models;
+	}
+	return [];
+}
+
+function hasCloudCredentialSync(provider: CloudProviderDef): boolean {
+	try {
+		const c = readAuth()[provider.id];
+		if (c?.key || c?.access) return true;
+	} catch {}
+	return Boolean(process.env[provider.apiKeyEnv]);
+}
+
+function seedCloudDefsFromCache() {
+	for (const provider of getCloudProviders()) {
+		const key = hasCloudCredentialSync(provider);
+		const cached = loadCloudDefsFromCache(provider);
+		cloudDefsByProvider[provider.id] = key
+			? ensureCloudLoginSeed(cached)
+			: CLOUD_LOGIN_SEED;
+	}
+}
 
 async function loadPlanDefs(
 	force: boolean,
@@ -820,8 +918,12 @@ function ensureCloudLoginSeed(models: ProviderModelConfig[]) {
 	return models.length ? models : CLOUD_LOGIN_SEED;
 }
 
-async function refreshCloudProvider(provider: CloudProviderDef, force: boolean) {
-	const key = readCloudKey(provider);
+async function refreshCloudProvider(
+	provider: CloudProviderDef,
+	force: boolean,
+	resolver?: CredentialResolver,
+) {
+	const key = await resolveCloudKey(provider, resolver);
 	if (!key) {
 		cloudDefsByProvider[provider.id] = CLOUD_LOGIN_SEED;
 		return { provider, keyPresent: false, count: 0 };
@@ -831,9 +933,14 @@ async function refreshCloudProvider(provider: CloudProviderDef, force: boolean) 
 	return { provider, keyPresent: true, count: models.length };
 }
 
-async function refreshCloudProviders(force: boolean) {
+async function refreshCloudProviders(
+	force: boolean,
+	resolver?: CredentialResolver,
+) {
 	return Promise.all(
-		getCloudProviders().map((provider) => refreshCloudProvider(provider, force)),
+		getCloudProviders().map((provider) =>
+			refreshCloudProvider(provider, force, resolver),
+		),
 	);
 }
 
@@ -943,10 +1050,13 @@ const createPlanOAuth = () => ({
 	async login(callbacks: {
 		onPrompt: (prompt: { message: string; placeholder?: string }) => Promise<string>;
 	}) {
-		const key = await callbacks.onPrompt({
-			message:
-				"Coding Plan token (sk-sp-… or sk-tok-…). Run /alibaba afterwards if you need a non-Singapore region:",
-		});
+		const key = (
+			await callbacks.onPrompt({
+				message:
+					"Coding Plan token (sk-sp-… or sk-tok-…). Run /alibaba afterwards if you need a non-Singapore region:",
+				placeholder: "sk-sp-...",
+			})
+		).trim();
 		if (!isPlanKey(key)) {
 			throw new Error(
 				"This doesn't look like a Coding Plan token (expected sk-sp-… or sk-tok-…). " +
@@ -1007,10 +1117,12 @@ const registerPlanProvider = (
 			...base,
 			fetchDynamicModels: async (apiKey: string | undefined) => {
 				if (!apiKey) return [];
+				const cached = loadPlanDefsFromCache();
+				if (!cached.length) return [];
+				planDefs = cached;
 				const creds = { access: apiKey };
-				planDefs = await loadPlanDefs(false, creds);
 				const ep = resolvePlanEndpoints(creds);
-				return buildPlanModels(planDefs, ep.openai, ep.anthropic);
+				return buildPlanModels(cached, ep.openai, ep.anthropic);
 			},
 		} as unknown as OmpProviderConfig);
 	} else {
@@ -1027,8 +1139,8 @@ const registerPlanProvider = (
 
 // ── Main ──────────────────────────────────────────────────────────────
 // Async factory: pi awaits this before provider registrations are flushed.
-// Fetch live model catalogs before registerProvider() so enabledModels
-// validation sees the real catalog immediately. No fallbacks.
+// Model catalogs are loaded from on-disk cache only at startup — live API
+// fetches happen exclusively via /alibaba → "Refresh model lists".
 export default async function (pi: ExtensionAPI) {
 	configureAgentDir(pi);
 	const omp = isOmpRuntime;
@@ -1040,44 +1152,18 @@ export default async function (pi: ExtensionAPI) {
 		planCreds = readAuth()["alibaba-plan"];
 	} catch {}
 
-	// ── Live catalog fetch (before provider registration) ───────────────
+	// ── Cache-only catalog seed (no network at startup) ─────────────────
 	const planEndpoints = resolvePlanEndpoints(planCreds);
 	const cloudFmt = config.cloudApiFormat || "anthropic-messages";
 
-	if (planCreds?.access) planDefs = await loadPlanDefs(true, planCreds);
-	if (!omp) await refreshCloudProviders(true);
+	if (planCreds?.access) planDefs = loadPlanDefsFromCache();
+	seedCloudDefsFromCache();
 
 	// ── Plan provider ───────────────────────────────────────────────────
 	registerPlanProvider(pi, planEndpoints, omp);
 
-
 	// ── Cloud providers ─────────────────────────────────────────────────
 	registerCloudProviders(pi, cloudDefsByProvider, cloudFmt);
-
-	// ── Lazy refresh: fetch live catalogs and re-register ───────────────
-	pi.on("session_start", async () => {
-		try {
-			const planCred = readAuth()["alibaba-plan"];
-			planDefs = await loadPlanDefs(false, planCred);
-
-			if (!isOmpRuntime) await refreshCloudProviders(false);
-
-			// Re-register both provider families with the expanded model lists
-			const currentConfig = loadConfig();
-			const currentPlanCreds = readAuth()["alibaba-plan"];
-			const ep = resolvePlanEndpoints(currentPlanCreds);
-			const currentFmt = currentConfig.cloudApiFormat || "anthropic-messages";
-
-			registerPlanProvider(pi, ep, isOmpRuntime);
-
-			registerCloudProviders(pi, cloudDefsByProvider, currentFmt);
-		} catch (e: unknown) {
-			const message = e instanceof Error ? e.message : String(e);
-			console.warn(
-				`[alibaba] session_start catalog refresh failed (${message}); keeping previously loaded models.`,
-			);
-		}
-	});
 
 	// ── Command: /alibaba ──────────────────────────────────────────────
 	pi.registerCommand("alibaba", {
@@ -1096,8 +1182,8 @@ export default async function (pi: ExtensionAPI) {
 			if (!choice) return;
 
 			const cfg = loadConfig();
-			const auth = readAuth();
-			const planCred = auth["alibaba-plan"];
+			const resolver = credentialResolver(ctx.modelRegistry.authStorage);
+			const planCred = getPlanCreds(resolver);
 
 			if (choice === "Status") {
 				const ep = resolvePlanEndpoints(planCred);
@@ -1131,7 +1217,7 @@ export default async function (pi: ExtensionAPI) {
 						: defs.length
 							? "live, not cached"
 							: "not fetched";
-					const cred = auth[provider.id];
+					const cred = resolver.get?.(provider.id);
 					const authState = cred
 						? "logged in"
 						: process.env[provider.apiKeyEnv]
@@ -1159,9 +1245,10 @@ export default async function (pi: ExtensionAPI) {
 
 			if (choice === "Refresh model lists") {
 				try {
-					const planCred = readAuth()["alibaba-plan"];
+					const refreshResolver = credentialResolver(ctx.modelRegistry.authStorage);
+					const planCred = getPlanCreds(refreshResolver);
 					planDefs = await loadPlanDefs(true, planCred);
-					const cloudResults = await refreshCloudProviders(true);
+					const cloudResults = await refreshCloudProviders(true, refreshResolver);
 					const cloudSummary = cloudResults
 						.map((result) =>
 							result.keyPresent
