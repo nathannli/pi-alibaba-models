@@ -6,7 +6,7 @@ The complete [`pi`](https://github.com/badlogic/pi-mono) and [`oh-my-pi`](https:
 
 - **Dual Provider Support**: Both the subscription-based Model Studio Coding Plan **and** the pay-per-token Alibaba Cloud (DashScope) — registered side by side, switch per chat from the model picker.
 - **Both API Shapes**: Anthropic-compatible (`/v1/messages`) by default; OpenAI-compatible (`/compatible-mode/v1`) auto-selected for DeepSeek and selectable per-Cloud via `/alibaba`.
-- **Three Cloud Regions**: International (`dashscope-intl.aliyuncs.com`), China (`dashscope.aliyuncs.com`), and Global (`dashscope-us.aliyuncs.com`) — pick your region at login via the matching Cloud provider.
+- **All Three Cloud Regions — Simultaneously**: International (`dashscope-intl.aliyuncs.com`), China (`dashscope.aliyuncs.com`), and Global (`dashscope-us.aliyuncs.com`) are all registered as separate providers. Log into any or all of them at once — each with its own API key — and switch between regions per-chat from the model picker.
 - **Native Reasoning**: First-class thinking-level support for every reasoning-capable model (Qwen 3.7 Max/Plus, Qwen 3.6 Max/Plus, DeepSeek V4, Kimi K2.6, GLM-5, MiniMax M2.5).
 - **Vision Capable**: Image input automatically enabled for VL models and Qwen 3.x Plus variants.
 - **Live Catalog**: Model catalogs are seeded from on-disk cache at startup — no network calls until you ask for them. Run `/alibaba → Refresh model lists` to pull the latest from DashScope. New models appear as Alibaba ships them — no extension update needed.
@@ -19,7 +19,7 @@ The complete [`pi`](https://github.com/badlogic/pi-mono) and [`oh-my-pi`](https:
 3. Type `/login` in your pi chat input.
 4. Select your provider based on your account type:
    - Choose **Plans > Alibaba Model Studio Coding Plan** if you have a subscription (your token likely starts with `sk-sp-` or `sk-tok-`).
-   - Choose **Use an API key > Alibaba Cloud (API Key)** if you use the pay-as-you-go DashScope service (your token likely starts with `sk-`).
+   - Choose **API Keys > Alibaba Cloud International / China / Global** for each pay-as-you-go DashScope region you use (your API keys likely start with `sk-`). You can log into any or all three regions — repeat `/login` for each one.
 5. Paste your token when prompted.
 6. Open the model picker, select a model (e.g., `Qwen 3.7 Max`, `Qwen 3.7 Plus`, `Qwen 3.6 Max`, or `DeepSeek V4 Pro`), and start chatting!
 
