@@ -25,18 +25,16 @@ The complete [`pi`](https://github.com/badlogic/pi-mono) extension for Alibaba's
 ## Install
 
 ```bash
-# recommended
-pi install pi-alibaba-models
+# pi (from fork)
+pi install git:github.com/nathannli/pi-alibaba-models
+```
 
-# explicit npm form (fallback if the bare name doesn't resolve)
-pi install npm:pi-alibaba-models
+Or clone locally first (for development / modifications):
 
-# or from GitHub
-pi install git:github.com/Fornace/pi-alibaba-models
-
-# or from a local checkout (development)
-git clone https://github.com/Fornace/pi-alibaba-models
-cd pi-alibaba-models && pi install .
+```bash
+git clone https://github.com/nathannli/pi-alibaba-models
+cd pi-alibaba-models
+pi install .
 ```
 
 After install, restart `pi`. The extension registers two providers and a slash command on every boot.
@@ -143,7 +141,7 @@ Cached at `~/.pi/agent/alibaba-plan-models.cache.json` for **4 hours**. The live
 - **`sk-sp-` accidentally pasted into the Cloud slot** → run `/alibaba → Re-login Cloud`, then `/login → Alibaba Model Studio Coding Plan` and paste it there. (The login validators will also catch this and offer to redirect you.)
 - **DeepSeek hangs / times out** → make sure you're on the latest version of this extension; it forces DeepSeek to OpenAI-compat. If you customised plan endpoints, verify the OpenAI URL ends in `/compatible-mode/v1`.
 - **Plan picker shows models that 404 at request time** → your subscription tier may not include every advertised model. The picker shows whatever upstream advertises; the API tells you "model_not_found" only when you actually call it.
-- **`/alibaba` command doesn't appear** → `pi list` should show `pi-alibaba-models` (or whatever source you installed from) under "User packages". If absent, run `pi install pi-alibaba-models` again and restart `pi`.
+- **`/alibaba` command doesn't appear** → `pi list` should show `pi-alibaba-models` (or whatever source you installed from) under "User packages". If absent, re-install from your local clone (`cd pi-alibaba-models && pi install .`) and restart `pi`.
 
 ## Files
 
