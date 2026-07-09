@@ -55,23 +55,34 @@ interface PlanCache { fetchedAt: number; source: string; models: PlanModelDef[];
 // The /models API only returns ids/names, not capabilities — so context
 // window, reasoning, and vision are inferred from the id. Both the Plan
 // and Cloud code paths route through these helpers so they never drift
-// apart. Context windows reflect Alibaba's published specs as of June 2026
-// and are corrected here as new models ship.
+// apart. Context windows are corrected here as new models ship.
 const isVisionModel = (id: string): boolean =>
   /vl|vision/i.test(id) || /^qwen3\.\d+-plus\b/i.test(id) || /kimi/i.test(id);
 
 const isReasoningModel = (id: string): boolean =>
   /qwq|max|thinking|deepseek|minimax|kimi|glm|3\.[5-9]/i.test(id);
 
+// Infer context window (tokens) from model id. Sources:
+// https://www.alibabacloud.com/help/en/model-studio/models
+// https://www.alibabacloud.com/help/en/model-studio/glm
 const inferContextWindow = (id: string, overrides?: Record<string, number>): number => {
-  // User overrides win: exact id first, then the "*" catch-all.
   const o = overrides?.[id] ?? overrides?.["*"];
   if (typeof o === "number" && o > 0) return o;
-  if (/flash/i.test(id)) return 131072;
+
+  // Third-party models
+  if (/^glm-?5\.2\b/i.test(id)) return 1048576;
+  if (/^glm/i.test(id)) return 202752;
+  if (/deepseek-?v4/i.test(id)) return 1048576;
+  if (/^deepseek/i.test(id)) return 131072;
   if (/kimi/i.test(id)) return 262144;
-  if (/^qwen3\.6-max\b/i.test(id)) return 262144; // 3.6 Max = 256K
-  // 3.6 Plus and every 3.7+ Plus/Max ship a 1M context window.
-  if (/^qwen3\.6-plus\b/i.test(id) || /^qwen3\.([7-9]|\d{2,})-(plus|max)\b/i.test(id)) return 1048576;
+  if (/minimax-?m2\.5/i.test(id)) return 196608;
+  if (/minimax-?m2\.1/i.test(id)) return 204800;
+  if (/minimax/i.test(id)) return 196608;
+
+  // Qwen 3.7+: all 1M. Qwen 3.5/3.6: plus/flash = 1M, max/open-weight = 256K.
+  if (/^qwen3\.([7-9]|\d{2,})\b/i.test(id)) return 1048576;
+  if (/^qwen3\.[56]\b/i.test(id)) return /(plus|flash)/i.test(id) ? 1048576 : 262144;
+
   return 131072;
 };
 
@@ -270,7 +281,12 @@ async function loadPlanDefs(force: boolean, credentials?: { access?: string; ref
     const cache = readJSON<PlanCache | null>(PLAN_CACHE_PATH, null);
     if (cache?.models?.length) {
       console.warn(`[alibaba] Plan catalog fetch failed (${e?.message || e}); using cached models (${cache.models.length}, ${cacheAgeMin(cache.fetchedAt)}m old).`);
-      return cache.models;
+      // Recompute context windows to apply the latest inferContextWindow logic
+      const overrides = loadConfig().contextWindowOverrides;
+      return cache.models.map(m => ({
+        ...m,
+        contextWindow: inferContextWindow(m.id, overrides),
+      }));
     }
     console.warn(`[alibaba] Plan catalog fetch failed (${e?.message || e}); no cache — Plan models unavailable until reconnected. Other providers still work.`);
     return [];
@@ -284,7 +300,12 @@ async function loadCloudDefs(domain: string, apiKey: string, force: boolean): Pr
     const cache = readJSON<CloudCache | null>(CLOUD_CACHE_PATH, null);
     if (cache?.models?.length && cache.domain === domain) {
       console.warn(`[alibaba] Cloud catalog fetch failed (${e?.message || e}); using cached models (${cache.models.length}, ${cacheAgeMin(cache.fetchedAt)}m old).`);
-      return cache.models;
+      // Recompute context windows to apply the latest inferContextWindow logic
+      const overrides = loadConfig().contextWindowOverrides;
+      return cache.models.map(m => ({
+        ...m,
+        contextWindow: inferContextWindow(m.id, overrides),
+      }));
     }
     console.warn(`[alibaba] Cloud catalog fetch failed (${e?.message || e}); no cache — Cloud models unavailable until reconnected. Other providers still work.`);
     return [];
