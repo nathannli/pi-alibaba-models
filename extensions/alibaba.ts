@@ -130,12 +130,12 @@ const DASHSCOPE_CONSOLE_URL: Record<CloudProviderId, string> = {
 };
 
 
-const credentialResolver = (authStorage: {
+const credentialResolver = (authStorage?: {
 	get: (provider: string) => AuthEntry | undefined;
 	peekApiKey?: (provider: string) => Promise<string | undefined>;
 }): CredentialResolver => ({
-	get: (provider) => authStorage.get(provider),
-	peekApiKey: authStorage.peekApiKey?.bind(authStorage),
+	get: authStorage ? (provider) => authStorage.get(provider) : undefined,
+	peekApiKey: authStorage?.peekApiKey?.bind(authStorage),
 });
 const getPlanCreds = (
 	resolver?: CredentialResolver,
@@ -464,7 +464,9 @@ function resolvePlanEndpoints(credentials?: {
 			const parsed = JSON.parse(credentials.refresh);
 			if (parsed.openai && parsed.anthropic)
 				return { openai: parsed.openai, anthropic: parsed.anthropic };
-		} catch {}
+		} catch {
+			// credentials.refresh is not valid JSON; fall back to config defaults
+		}
 	}
 	const cfg = loadConfig();
 	return {
@@ -633,7 +635,12 @@ async function fetchRichCloudModelRows(
 	let pageNo = 1;
 	let total = Number.POSITIVE_INFINITY;
 	while (rows.length < total) {
-		const url = new URL(provider.modelsUrl);
+		let url: URL;
+		try {
+			url = new URL(provider.modelsUrl);
+		} catch (err) {
+			throw new Error(`Invalid modelsUrl for ${provider.id}: ${(err as Error).message}`);
+		}
 		url.searchParams.set("page_no", String(pageNo));
 		const res = await fetch(url, {
 			headers: { Authorization: `Bearer ${apiKey}` },
@@ -904,7 +911,9 @@ async function resolveCloudKey(
 		try {
 			const key = await resolver.peekApiKey(provider.id);
 			if (key && key !== "N/A") return key;
-		} catch {}
+		} catch {
+			// peekApiKey failed; continue to fallback resolution methods
+		}
 	}
 	if (resolver?.get) {
 		const cred = resolver.get?.(provider.id);
@@ -916,7 +925,9 @@ async function resolveCloudKey(
 			const c = readAuth()[provider.id];
 			const k = c?.key || c?.access;
 			if (k) return k;
-		} catch {}
+		} catch {
+			// readAuth() failed or provider not in auth store; continue to env var fallback
+		}
 	}
 	return process.env[provider.apiKeyEnv] || null;
 }
@@ -970,7 +981,9 @@ function hasCloudCredentialSync(provider: CloudProviderDef): boolean {
 	try {
 		const c = readAuth()[provider.id];
 		if (c?.key || c?.access) return true;
-	} catch {}
+	} catch {
+		// readAuth() failed; fall through to env var check
+	}
 	return Boolean(process.env[provider.apiKeyEnv]);
 }
 
@@ -1077,7 +1090,7 @@ function allCloudModelIds() {
 // ── Module-level mutable model lists ─────────────────────────────────
 // Populated by the async extension factory before provider registration.
 let planDefs: PlanModelDef[] = [];
-let cloudDefsByProvider = createEmptyCloudDefs();
+const cloudDefsByProvider = createEmptyCloudDefs();
 
 // ── Migration ─────────────────────────────────────────────────────────
 const isPlanKey = (k: string) =>
@@ -1165,7 +1178,10 @@ function migrateLegacyAuth() {
 		}
 
 		if (dirty) writeAuth(auth);
-	} catch {}
+	} catch {
+		// Migration is best-effort; if auth file is corrupt or unreadable,
+		// we don't want to block extension startup
+	}
 }
 
 
@@ -1274,7 +1290,10 @@ export default async function (pi: ExtensionAPI) {
 	let planCreds: { access?: string; refresh?: string } | undefined;
 	try {
 		planCreds = readAuth()["alibaba-plan"];
-	} catch {}
+	} catch {
+		// If auth file is missing or corrupt, planCreds stays undefined;
+		// extension will fall back to cache or require fresh login
+	}
 
 	// ── Cache-only catalog seed (no network at startup) ─────────────────
 	const planEndpoints = resolvePlanEndpoints(planCreds);
@@ -1608,7 +1627,10 @@ export default async function (pi: ExtensionAPI) {
 						touched = true;
 					}
 					if (touched) writeJSON(SETTINGS_PATH, s);
-				} catch {}
+				} catch {
+					// Settings file might be missing or corrupt;
+					// still notify user that credentials were wiped
+				}
 				ctx.ui.notify(
 					"All Alibaba settings wiped. Now safe to `pi remove`.",
 					"info",
