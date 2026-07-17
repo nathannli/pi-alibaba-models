@@ -1,10 +1,10 @@
 # pi-alibaba-models
 
-The complete [`pi`](https://github.com/badlogic/pi-mono) extension for Alibaba's model lineup — **Qwen 3.7 Max**, **Qwen 3.7 Plus** (both 1M context), **Qwen 3.6 Max**, **Qwen 3.6 Plus**, **DeepSeek V4 Pro**, **Kimi K2.6**, **GLM-5**, **MiniMax M2.5**, and the rest of the catalog. Native thinking-level support, both Anthropic- and OpenAI-shaped APIs, both International and China endpoints, both Coding Plan subscriptions and pay-per-token Cloud keys.
+The complete [`pi`](https://github.com/badlogic/pi-mono) extension for Alibaba's model lineup — **Qwen 3.7 Max**, **Qwen 3.7 Plus** (both 1M context), **Qwen 3.6 Max**, **Qwen 3.6 Plus**, **DeepSeek V4 Pro**, **Kimi K2.6**, **GLM-5**, **MiniMax M2.5**, and the rest of the catalog. Native thinking-level support, both Anthropic- and OpenAI-shaped APIs, International, China, and Global endpoints, both Coding Plan subscriptions and pay-per-token Cloud keys.
 
 ## Features
 
-- **Dual Provider Support**: Both the subscription-based Model Studio Coding Plan **and** the pay-per-token Alibaba Cloud (DashScope) — registered side by side, switch per chat from the model picker.
+- **Plan + Regional Cloud Providers**: Model Studio Coding Plan plus International, China, and Global pay-per-token DashScope providers — registered side by side, switch per chat from the model picker.
 - **Both API Shapes**: Anthropic-compatible (`/v1/messages`) by default; OpenAI-compatible (`/compatible-mode/v1`) auto-selected for DeepSeek and selectable per-Cloud via `/alibaba`.
 - **All Three Cloud Regions — Simultaneously**: International (`dashscope-intl.aliyuncs.com`), China (`dashscope.aliyuncs.com`), and Global (`dashscope-us.aliyuncs.com`) are all registered as separate providers. Log into any or all of them at once — each with its own API key — and switch between regions per-chat from the model picker.
 - **Native Reasoning**: First-class thinking-level support for every reasoning-capable model (Qwen 3.7 Max/Plus, Qwen 3.6 Max/Plus, DeepSeek V4, Kimi K2.6, GLM-5, MiniMax M2.5).
@@ -37,35 +37,37 @@ cd pi-alibaba-models
 pi install .
 ```
 
-After install, restart `pi`. The extension registers two providers and a slash command on every boot.
+After install, restart `pi`. The extension registers four providers and a slash command on every boot.
 
 ## Uninstall
 
 `pi remove` only removes the package entry from `settings.json["packages"]` — it does not clean extension-private state (auth entries, config, model cache, enabled-model lists). For a clean uninstall:
 
 ```text
-1. /alibaba  →  "Reset all"      (wipes config, both auth entries, plan-models cache, alibaba-* enabledModels)
+1. /alibaba  →  "Reset all"      (wipes config, all Alibaba auth entries, model caches, alibaba-* enabledModels)
 2. pi remove pi-alibaba-models
 ```
 
 If you've already run `pi remove` and want to clean leftovers manually:
 
 ```bash
-rm -f ~/.pi/agent/alibaba-config.json ~/.pi/agent/alibaba-plan-models.cache.json
-# then edit ~/.pi/agent/auth.json and remove the "alibaba-plan" / "alibaba-cloud" entries
-# then edit ~/.pi/agent/settings.json and drop any "alibaba-*/..." or "dashscope/..." entries from enabledModels
+rm -f ~/.pi/agent/alibaba-config.json ~/.pi/agent/alibaba-*-models.cache.json ~/.pi/agent/alibaba-models-dev.cache.json
+# then edit ~/.pi/agent/auth.json and remove the "alibaba", "alibaba-cn", "alibaba-global", and "alibaba-plan" entries
+# then edit ~/.pi/agent/settings.json and drop any "alibaba/...", "alibaba-*/...", or "dashscope/..." entries from enabledModels
 ```
 
-## Two providers
+## Providers
 
-| Provider id    | Section in `/login`     | Auth shape | Use it for                                 |
-|----------------|-------------------------|------------|--------------------------------------------|
-| `alibaba-plan` | Plans                   | OAuth (paste token) | Model Studio Coding Plan subscription |
-| `alibaba-cloud`| API Keys (via OAuth UI) | OAuth (paste API key) | Pay-per-token DashScope API           |
+| Provider id     | Section in `/login` | Authentication | Use it for |
+|-----------------|---------------------|----------------|------------|
+| `alibaba-plan`  | Plans               | Coding Plan token | Model Studio Coding Plan subscription |
+| `alibaba`       | API Keys            | DashScope API key | International Cloud |
+| `alibaba-cn`    | API Keys            | DashScope API key | China Cloud |
+| `alibaba-global`| API Keys            | DashScope API key | Global Cloud |
 
-Both are registered as `oauth`-shaped providers so they appear in `/login` and live in `~/.pi/agent/auth.json` under their respective keys. The Plan provider stores the chosen endpoints in the `refresh` field as JSON; the Cloud provider stores its domain in `~/.pi/agent/alibaba-config.json`.
+All four providers register simultaneously. Cloud credentials remain independent, so any combination of regions can be active at once. The Plan provider stores chosen endpoints in its credential metadata.
 
-> **Cloud without `/login`:** the Cloud provider also reads the `DASHSCOPE_API_KEY` environment variable. If it's set, the extension fetches your live model catalog from it on startup — no `/login` needed. With **no** credential at all (no `/login`, no env var) the Cloud provider still shows up in `/login → Use an API key` via a single placeholder model, so you can sign in; your real catalog replaces it the moment a key is present.
+> **Cloud without `/login`:** regional providers also read `DASHSCOPE_API_KEY`, `DASHSCOPE_CN_API_KEY`, and `DASHSCOPE_GLOBAL_API_KEY`, respectively. Each provider fetches its live catalog at startup. With no credential, it remains visible in `/login → Use an API key` through a placeholder model.
 
 ### Endpoints
 
@@ -74,10 +76,13 @@ Both are registered as `oauth`-shaped providers so they appear in `/login` and l
 - Anthropic-compat: `https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic` (pi appends `/v1/messages`)
 - OpenAI-compat:    `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`
 
-**Cloud (default International):**
+**Cloud:**
 
-- Anthropic-compat: `https://dashscope-intl.aliyuncs.com/apps/anthropic`
-- OpenAI-compat:    `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`
+| Region | Anthropic-compat | OpenAI-compat |
+|--------|------------------|---------------|
+| International | `https://dashscope-intl.aliyuncs.com/apps/anthropic` | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` |
+| China | `https://dashscope.aliyuncs.com/apps/anthropic` | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+| Global | `https://dashscope-us.aliyuncs.com/apps/anthropic` | `https://dashscope-us.aliyuncs.com/compatible-mode/v1` |
 
 ## Key prefix reference
 
@@ -85,7 +90,7 @@ Both are registered as `oauth`-shaped providers so they appear in `/login` and l
 |-------------|----------------|-------------------------------------------------------------------|
 | `sk-sp-`    | `alibaba-plan` | Model Studio Coding Plan console — Singapore / Global             |
 | `sk-tok-`   | `alibaba-plan` | Model Studio Coding Plan console — alternate token format         |
-| `sk-`(other)| `alibaba-cloud`| DashScope API Keys console (per-token billing)                    |
+| `sk-`(other)| regional Cloud provider | DashScope API Keys console (per-token billing)              |
 
 Consoles:
 
@@ -100,18 +105,14 @@ The login flow validates the prefix and offers to redirect you to the correct pr
 | Region        | Plan host                                         | Cloud host                       |
 |---------------|---------------------------------------------------|----------------------------------|
 | International | `token-plan.ap-southeast-1.maas.aliyuncs.com`     | `dashscope-intl.aliyuncs.com`    |
-| China         | (region-specific host, paste via "Custom")        | `dashscope.aliyuncs.com`         |
-| Custom        | paste both base URLs at login                     | paste domain at login            |
+| China         | configurable through Plan endpoints               | `dashscope.aliyuncs.com`         |
+| Global        | configurable through Plan endpoints               | `dashscope-us.aliyuncs.com`      |
 
 ## Studio plan models — dynamic source
 
-The plan model list is fetched from the canonical Qwen Code template:
+Plan models come from the Plan endpoint's live `/compatible-mode/v1/models` response. Cloud models prefer Alibaba's rich `/api/v1/models` catalogs for context windows, output limits, modalities, capabilities, and regional pricing. If a rich catalog fails or times out, the extension falls back to that region's compatible `/v1/models` endpoint.
 
-<https://github.com/QwenLM/qwen-code/blob/main/packages/cli/src/constants/codingPlan.ts>
-
-Cached at `~/.pi/agent/alibaba-plan-models.cache.json` for **4 hours**. The live API is always the source of truth; on a failed fetch the extension falls back to the last-known-good on-disk cache (and, if there's no cache either, registers an empty list rather than crashing). Force a refresh from `/alibaba → Refresh model lists`.
-
-`deepseek-v3.2` (and any plan-served models the upstream template omits) is merged in via a small allow-list so the picker reflects what the endpoint actually serves. The Cloud provider mirrors the live `/v1/models` response — V4 Pro/Flash, Qwen 3.7 Max/Plus, Qwen 3.6 Max/Plus, Kimi K2.6, GLM-5, MiniMax M2.5 etc. all surface automatically as Alibaba ships them.
+Each catalog has a separate last-known-good disk cache. Network failures use the matching cache instead of preventing pi from starting. Force all regions to refresh in parallel from `/alibaba → Refresh model lists`.
 
 ## Limitations & Known Issues
 
@@ -128,12 +129,11 @@ Cached at `~/.pi/agent/alibaba-plan-models.cache.json` for **4 hours**. The live
 | Status                       | Print Plan/Cloud login state, active endpoints, model count, cache age   |
 | Refresh model lists          | Force-refetch Plan + Cloud catalogs and reload the extension             |
 | Re-login Plan                | Wipe `alibaba-plan` from `auth.json` and reload (then run `/login`)      |
-| Re-login Cloud               | Wipe `alibaba-cloud` from `auth.json` and reload (then run `/login`)     |
+| Re-login Cloud               | Select and wipe one regional Cloud credential, then reload              |
 | Plan — Change Endpoints      | Override OpenAI / Anthropic base URLs                                    |
-| Cloud — Change Domain        | International / China / Custom domain                                    |
 | Cloud — Change API Format    | Switch between Anthropic-compat and OpenAI-compat                        |
 | Context Window — Override    | Set the context-window shown on a model's card (per model, or `*` for all) |
-| Reset all                    | Wipe all Alibaba state (config, both auth entries, plan-models cache)    |
+| Reset all                    | Wipe config, all Alibaba credentials, caches, and settings entries       |
 
 ## Troubleshooting
 
@@ -147,10 +147,13 @@ Cached at `~/.pi/agent/alibaba-plan-models.cache.json` for **4 hours**. The live
 
 | Path                                                  | Purpose                            |
 |-------------------------------------------------------|------------------------------------|
-| `~/.pi/agent/auth.json`                               | Both provider credentials (0600)   |
-| `~/.pi/agent/alibaba-config.json`                     | Endpoint / domain / format config  |
-| `~/.pi/agent/alibaba-plan-models.cache.json`          | 48 h plan-models cache             |
-| `~/.pi/agent/alibaba-cloud-models.cache.json`         | 48 h cloud-models cache            |
+| `~/.pi/agent/auth.json`                               | Plan and regional Cloud credentials (0600) |
+| `~/.pi/agent/alibaba-config.json`                     | Plan endpoint and Cloud format config |
+| `~/.pi/agent/alibaba-plan-models.cache.json`          | Plan model cache                    |
+| `~/.pi/agent/alibaba-cloud-models.cache.json`         | International Cloud model cache     |
+| `~/.pi/agent/alibaba-cn-models.cache.json`            | China Cloud model cache             |
+| `~/.pi/agent/alibaba-global-models.cache.json`        | Global Cloud model cache            |
+| `~/.pi/agent/alibaba-models-dev.cache.json`           | models.dev metadata cache           |
 
 ## From the same author
 

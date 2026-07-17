@@ -8,23 +8,65 @@ const HOME_DIR = path.join(os.homedir(), ".pi", "agent");
 const CONFIG_PATH = path.join(HOME_DIR, "alibaba-config.json");
 const AUTH_PATH = path.join(HOME_DIR, "auth.json");
 const PLAN_CACHE_PATH = path.join(HOME_DIR, "alibaba-plan-models.cache.json");
-const CLOUD_CACHE_PATH = path.join(HOME_DIR, "alibaba-cloud-models.cache.json");
+const SETTINGS_PATH = path.join(HOME_DIR, "settings.json");
 
-const MODELS_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
+const CLOUD_RICH_FETCH_TIMEOUT_MS = 45_000;
+const CLOUD_COMPAT_FETCH_TIMEOUT_MS = 30_000;
 
 const DEFAULT_PLAN_OPENAI = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1";
 const DEFAULT_PLAN_ANTHROPIC = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
-const DEFAULT_CLOUD_DOMAIN = "dashscope-intl.aliyuncs.com";
+const ALIBABA_CLOUD_MODEL_STUDIO_INTL_URL = "dashscope-intl.aliyuncs.com";
+const ALIBABA_CLOUD_MODEL_STUDIO_CN_URL = "dashscope.aliyuncs.com";
+const ALIBABA_CLOUD_MODEL_STUDIO_GLOBAL_URL = "dashscope-us.aliyuncs.com";
 
 const MODELS_DEV_API_URL = "https://models.dev/api.json";
 const MODELS_DEV_CACHE_PATH = path.join(HOME_DIR, "alibaba-models-dev.cache.json");
 const MODELS_DEV_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
+type CloudProviderId = "alibaba" | "alibaba-cn" | "alibaba-global";
+
+interface CloudProviderDef {
+  id: CloudProviderId;
+  name: string;
+  domain: string;
+  apiKeyEnv: string;
+  modelsUrl: string;
+  cachePath: string;
+}
+
+const CLOUD_PROVIDERS: readonly CloudProviderDef[] = [
+  {
+    id: "alibaba",
+    name: "Alibaba Cloud International (API Key)",
+    domain: ALIBABA_CLOUD_MODEL_STUDIO_INTL_URL,
+    apiKeyEnv: "DASHSCOPE_API_KEY",
+    modelsUrl: "https://dashscope-intl.aliyuncs.com/api/v1/models",
+    cachePath: path.join(HOME_DIR, "alibaba-cloud-models.cache.json"),
+  },
+  {
+    id: "alibaba-cn",
+    name: "Alibaba Cloud China (API Key)",
+    domain: ALIBABA_CLOUD_MODEL_STUDIO_CN_URL,
+    apiKeyEnv: "DASHSCOPE_CN_API_KEY",
+    modelsUrl: "https://dashscope.aliyuncs.com/api/v1/models",
+    cachePath: path.join(HOME_DIR, "alibaba-cn-models.cache.json"),
+  },
+  {
+    id: "alibaba-global",
+    name: "Alibaba Cloud Global (API Key)",
+    domain: ALIBABA_CLOUD_MODEL_STUDIO_GLOBAL_URL,
+    apiKeyEnv: "DASHSCOPE_GLOBAL_API_KEY",
+    modelsUrl: "https://dashscope-us.aliyuncs.com/api/v1/models",
+    cachePath: path.join(HOME_DIR, "alibaba-global-models.cache.json"),
+  },
+];
+
+const CLOUD_PROVIDER_IDS = CLOUD_PROVIDERS.map((provider) => provider.id);
+
 // ── Config / auth helpers ─────────────────────────────────────────────
 interface AlibabaConfig {
   planOpenAI?: string;
   planAnthropic?: string;
-  cloudDomain?: string;
   cloudApiFormat?: "anthropic-messages" | "openai-completions";
   // Override the context-window shown on a model's card in the picker.
   // Keyed by exact model id (e.g. "qwen3.7-plus"); the special key "*" applies
@@ -40,6 +82,14 @@ const writeJSON = (p: string, data: unknown) => {
   fs.mkdirSync(path.dirname(p), { recursive: true });
   fs.writeFileSync(p, JSON.stringify(data, null, 2), { mode: 0o600 });
 };
+
+function unlinkIfExists(filePath: string) {
+  try {
+    fs.unlinkSync(filePath);
+  } catch (e: unknown) {
+    if (!(e instanceof Error && "code" in e && e.code === "ENOENT")) throw e;
+  }
+}
 const loadConfig = (): AlibabaConfig => readJSON<AlibabaConfig>(CONFIG_PATH, {});
 const saveConfig = (c: AlibabaConfig) => writeJSON(CONFIG_PATH, c);
 const readAuth = (): Record<string, any> => readJSON<Record<string, any>>(AUTH_PATH, {});
@@ -270,7 +320,10 @@ function resolvePlanEndpoints(credentials?: { access?: string; refresh?: string 
     try {
       const parsed = JSON.parse(credentials.refresh);
       if (parsed.openai && parsed.anthropic) return { openai: parsed.openai, anthropic: parsed.anthropic };
-    } catch {}
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      console.warn(`[alibaba] Ignoring invalid Plan endpoint metadata (${message}).`);
+    }
   }
   const cfg = loadConfig();
   return {
@@ -296,86 +349,286 @@ function buildPlanModels(defs: PlanModelDef[], openaiUrl: string, anthropicUrl: 
 // ── Cloud builders ────────────────────────────────────────────────────
 interface CloudCache { fetchedAt: number; domain: string; models: ProviderModelConfig[]; }
 
-async function fetchCloudModels(domain: string, apiKey: string, _force = false): Promise<ProviderModelConfig[]> {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 4000);
-  try {
-    const res = await fetch(`https://${domain}/compatible-mode/v1/models`, {
-      headers: { Authorization: `Bearer ${apiKey}` },
-      signal: ctrl.signal,
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const json = (await res.json()) as { data?: { id: string; name?: string }[] };
-    if (!json.data?.length) throw new Error("No models");
-    // Filter out non-LLMs (image, audio, video, embedding, etc.) — we only want chat models.
-    const exclude = /(image|audio|video|tts|asr|embed|vector|rerank|wan|omni|livetranslate|realtime)/i;
-    const overrides = loadConfig().contextWindowOverrides;
-    
-    // Filter against models.dev registry and enrich with its data
-    const registry = await fetchModelsDevRegistry();
-    
-    const models = json.data
-      .filter((m) => !exclude.test(m.id))
-      .filter((m) => !isDateSuffixed(m.id)) // Always filter date-suffixed variants
-      .filter((m) => registry.size === 0 || registry.has(m.id)) // Allowlist when registry available
-      .map((m) => {
-        const devEntry = registry.get(m.id);
-        // Use models.dev attachment field if available, fall back to heuristic
-        const isVision = devEntry?.attachment === true || isVisionModel(m.id);
-        // Prefer models.dev reasoning flag if available, fall back to heuristic
-        const isReasoning = devEntry ? devEntry.reasoning : isReasoningModel(m.id);
-        // Prefer models.dev data, fall back to heuristics
-        const contextWindow = devEntry ? devEntry.contextWindow : inferContextWindow(m.id, overrides);
-        const maxTokens = devEntry ? devEntry.maxOutput : 8192;
-        const cost = devEntry ? {
-          input: devEntry.inputPrice,
-          output: devEntry.outputPrice,
-          cacheRead: 0,
-          cacheWrite: 0,
-        } : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-        
-        return {
-          id: m.id,
-          name: m.name || m.id,
-          reasoning: isReasoning,
-          input: isVision ? (["text", "image"] as ("text" | "image")[]) : (["text"] as ("text" | "image")[]),
-          cost,
-          contextWindow,
-          maxTokens,
-          compat: isReasoning ? { thinkingFormat: "qwen" as const } : undefined,
-        };
-      });
-    const cache: CloudCache = { fetchedAt: Date.now(), domain, models };
-    writeJSON(CLOUD_CACHE_PATH, cache);
-    return models;
-  } finally { clearTimeout(t); }
+interface CloudModelRow {
+  id: string;
+  name?: string;
+  requestModalities?: string[];
+  responseModalities?: string[];
+  capabilities?: string[];
+  contextWindow?: number;
+  maxTokens?: number;
+  cost?: ProviderModelConfig["cost"];
 }
 
-function buildCloudModels(models: ProviderModelConfig[], domain: string, fmt: string): ProviderModelConfig[] {
-  return models.map((m) => {
-    const useOpenAI = /deepseek/i.test(m.id) || fmt === "openai-completions";
+interface RichPrice { type?: string; price?: string; }
+interface RichPriceRange { range_name?: string; prices?: RichPrice[]; }
+interface CompatibleModelsResponse { data?: { id: string; name?: string }[]; }
+interface RichModelsResponse {
+  success?: boolean;
+  message?: string | null;
+  output?: {
+    total?: number;
+    page_no?: number;
+    page_size?: number;
+    models?: {
+      model?: string;
+      name?: string;
+      capabilities?: string[];
+      inference_metadata?: {
+        request_modality?: string[];
+        response_modality?: string[];
+      };
+      model_info?: {
+        context_window?: number | null;
+        max_output_tokens?: number | null;
+      };
+      prices?: RichPriceRange[];
+    }[];
+  };
+}
+
+const ZERO_COST: ProviderModelConfig["cost"] = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+const COST_DECIMAL_PLACES = 12;
+
+function normalizeCost(value: number | undefined): number {
+  return value === undefined ? 0 : Number(value.toFixed(COST_DECIMAL_PLACES));
+}
+
+function pricePerMillionTokens(price: string | undefined): number | undefined {
+  if (!price) return undefined;
+  const value = Number(price);
+  return Number.isFinite(value) && value >= 0 ? normalizeCost(value) : undefined;
+}
+
+function priceByType(prices: RichPrice[], predicate: (type: string) => boolean): number | undefined {
+  const found = prices.find((price) => price.type && predicate(price.type));
+  return pricePerMillionTokens(found?.price);
+}
+
+function richPricesToCost(ranges: RichPriceRange[] | undefined): ProviderModelConfig["cost"] | undefined {
+  if (!ranges?.length) return undefined;
+  const range = ranges.find((candidate) => /default/i.test(candidate.range_name || "")) ?? ranges[0];
+  const prices = range.prices ?? [];
+  const input =
+    priceByType(prices, (type) => type === "input_token") ??
+    priceByType(prices, (type) => type === "thinking_input_token");
+  const output =
+    priceByType(prices, (type) => type === "output_token") ??
+    priceByType(prices, (type) => type === "thinking_output_token");
+  const cacheRead =
+    priceByType(prices, (type) => type === "input_token_cache_read") ??
+    priceByType(prices, (type) => type === "thinking_input_token_cache_read") ??
+    priceByType(prices, (type) => type === "input_token_cache") ??
+    priceByType(prices, (type) => type === "thinking_input_token_cache");
+  const cacheWrite =
+    priceByType(prices, (type) => type.startsWith("input_token_cache_creation")) ??
+    priceByType(prices, (type) => type.startsWith("thinking_input_token_cache_creation"));
+  if (input === undefined && output === undefined && cacheRead === undefined && cacheWrite === undefined) return undefined;
+  return {
+    input: normalizeCost(input),
+    output: normalizeCost(output),
+    cacheRead: normalizeCost(cacheRead),
+    cacheWrite: normalizeCost(cacheWrite),
+  };
+}
+
+async function fetchCompatibleCloudModelRows(
+  provider: CloudProviderDef,
+  apiKey: string,
+  signal: AbortSignal,
+): Promise<CloudModelRow[]> {
+  const res = await fetch(`https://${provider.domain}/compatible-mode/v1/models`, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+    signal,
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const json = (await res.json()) as CompatibleModelsResponse;
+  if (!json.data?.length) throw new Error("No models");
+  return json.data.map((model) => ({ id: model.id, name: model.name }));
+}
+
+async function fetchRichCloudModelRows(
+  provider: CloudProviderDef,
+  apiKey: string,
+  signal: AbortSignal,
+): Promise<CloudModelRow[]> {
+  const rows: CloudModelRow[] = [];
+  let pageNo = 1;
+  while (true) {
+    let url: URL;
+    try {
+      url = new URL(provider.modelsUrl);
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      throw new Error(`Invalid rich catalog URL for ${provider.name}: ${message}`);
+    }
+    url.searchParams.set("page_no", String(pageNo));
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal,
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = (await res.json()) as RichModelsResponse;
+    if (json.success === false) throw new Error(json.message || "Rich model fetch failed");
+    const output = json.output;
+    const models = output?.models ?? [];
+    if (!models.length) break;
+    for (const model of models) {
+      if (!model.model) continue;
+      const info = model.model_info;
+      rows.push({
+        id: model.model,
+        name: model.name,
+        requestModalities: model.inference_metadata?.request_modality,
+        responseModalities: model.inference_metadata?.response_modality,
+        capabilities: model.capabilities,
+        contextWindow: info?.context_window ?? undefined,
+        maxTokens: info?.max_output_tokens ?? undefined,
+        cost: richPricesToCost(model.prices),
+      });
+    }
+    const pageSize = output?.page_size ?? models.length;
+    if ((output?.total !== undefined && rows.length >= output.total) || models.length < pageSize) break;
+    const nextPage = (output?.page_no ?? pageNo) + 1;
+    if (nextPage <= pageNo) break;
+    pageNo = nextPage;
+  }
+  return rows;
+}
+
+async function fetchWithTimeout<T>(
+  fetcher: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+): Promise<T> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetcher(ctrl.signal);
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function fetchCloudModelRows(provider: CloudProviderDef, apiKey: string): Promise<CloudModelRow[]> {
+  try {
+    const rows = await fetchWithTimeout(
+      (signal) => fetchRichCloudModelRows(provider, apiKey, signal),
+      CLOUD_RICH_FETCH_TIMEOUT_MS,
+    );
+    if (!rows.length) throw new Error("Rich catalog returned no models");
+    return rows;
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : String(e);
+    console.warn(`[alibaba] ${provider.name} rich catalog failed (${message}); trying compatible-mode /v1/models.`);
+  }
+  return fetchWithTimeout(
+    (signal) => fetchCompatibleCloudModelRows(provider, apiKey, signal),
+    CLOUD_COMPAT_FETCH_TIMEOUT_MS,
+  );
+}
+
+async function fetchCloudModels(
+  provider: CloudProviderDef,
+  apiKey: string,
+  _force = false,
+): Promise<ProviderModelConfig[]> {
+  const rows = await fetchCloudModelRows(provider, apiKey);
+  if (!rows.length) throw new Error("No models");
+  const exclude = /(image|audio|video|tts|asr|embed|vector|rerank|wan|omni|livetranslate|realtime)/i;
+  const overrides = loadConfig().contextWindowOverrides;
+  const registry = await fetchModelsDevRegistry();
+
+  const models = rows
+    .filter((model) => !exclude.test(model.id))
+    .filter((model) => !isDateSuffixed(model.id))
+    .filter((model) => registry.size === 0 || registry.has(model.id))
+    .filter((model) => !model.responseModalities?.length || model.responseModalities.some((modality) => /text/i.test(modality)))
+    .map((model) => {
+      const devEntry = registry.get(model.id);
+      const override = overrides?.[model.id] ?? overrides?.["*"];
+      const isVision =
+        devEntry?.attachment === true ||
+        isVisionModel(model.id) ||
+        model.requestModalities?.some((modality) => /image|video/i.test(modality)) === true;
+      const isReasoning =
+        devEntry?.reasoning === true ||
+        isReasoningModel(model.id) ||
+        model.capabilities?.some((capability) => /reasoning/i.test(capability)) === true;
+      const contextWindow =
+        typeof override === "number" && override > 0
+          ? override
+          : model.contextWindow && model.contextWindow > 0
+            ? model.contextWindow
+            : devEntry?.contextWindow ?? inferContextWindow(model.id, overrides);
+      const maxTokens =
+        model.maxTokens && model.maxTokens > 0
+          ? model.maxTokens
+          : devEntry?.maxOutput ?? 8192;
+      const cost = model.cost ?? (devEntry ? {
+        input: devEntry.inputPrice,
+        output: devEntry.outputPrice,
+        cacheRead: 0,
+        cacheWrite: 0,
+      } : ZERO_COST);
+      return {
+        id: model.id,
+        name: model.name || model.id,
+        reasoning: isReasoning,
+        input: isVision ? (["text", "image"] as ("text" | "image")[]) : (["text"] as ("text" | "image")[]),
+        cost,
+        contextWindow,
+        maxTokens,
+        compat: isReasoning ? { thinkingFormat: "qwen" as const } : undefined,
+      };
+    });
+  if (!models.length) throw new Error("Cloud catalog returned no supported chat models");
+  const cache: CloudCache = { fetchedAt: Date.now(), domain: provider.domain, models };
+  writeJSON(provider.cachePath, cache);
+  return models;
+}
+
+function buildCloudModels(
+  models: ProviderModelConfig[],
+  provider: CloudProviderDef,
+  fmt: string,
+): ProviderModelConfig[] {
+  return models.map((model) => {
+    const useOpenAI = /deepseek/i.test(model.id) || fmt === "openai-completions";
     return {
-      ...m,
-      thinkingLevelMap: m.reasoning ? { off: null } : undefined,
-      baseUrl: useOpenAI ? `https://${domain}/compatible-mode/v1` : `https://${domain}/apps/anthropic`,
+      ...model,
+      thinkingLevelMap: model.reasoning ? { off: null } : undefined,
+      baseUrl: useOpenAI
+        ? `https://${provider.domain}/compatible-mode/v1`
+        : `https://${provider.domain}/apps/anthropic`,
       api: (useOpenAI ? "openai-completions" : "anthropic-messages") as "anthropic-messages" | "openai-completions",
     };
   });
 }
 
+function registerCloudProviders(
+  pi: ExtensionAPI,
+  defsByProvider: Record<CloudProviderId, ProviderModelConfig[]>,
+  fmt: string,
+) {
+  for (const provider of CLOUD_PROVIDERS) {
+    pi.registerProvider(provider.id, {
+      name: provider.name,
+      baseUrl: `https://${provider.domain}/apps/anthropic`,
+      apiKey: `$${provider.apiKeyEnv}`,
+      api: "anthropic-messages",
+      authHeader: true,
+      models: buildCloudModels(defsByProvider[provider.id], provider, fmt),
+    });
+  }
+}
+
 // ── Cloud credential resolution ──────────────────────────────────────
-// The Cloud provider can authenticate either from a key saved via /login
-// (auth.json) OR from the DASHSCOPE_API_KEY env var (its apiKey is
-// "$DASHSCOPE_API_KEY"). Either one lets us fetch the real catalog — so we
-// always prefer the live list and only fall back to the login seed below
-// when there is no credential at all.
-const readCloudKey = (): string | null => {
-  try {
-    const c = readAuth()["alibaba-cloud"];
-    const k = c?.key || c?.access;
-    if (k) return k;
-  } catch {}
-  return process.env.DASHSCOPE_API_KEY || null;
+// Each Cloud provider can authenticate either from a key saved via /login
+// (auth.json) OR from its matching DASHSCOPE_* env var.
+const readCloudKey = (provider: CloudProviderDef): string | null => {
+  const credential = readAuth()[provider.id];
+  const key = credential?.key || credential?.access;
+  return key || process.env[provider.apiKeyEnv] || null;
 };
 
 // ── Cloud login seed ─────────────────────────────────────────────────
@@ -427,36 +680,77 @@ async function loadPlanDefs(force: boolean, credentials?: { access?: string; ref
   }
 }
 
-async function loadCloudDefs(domain: string, apiKey: string, force: boolean): Promise<ProviderModelConfig[]> {
+async function loadCloudDefs(
+  provider: CloudProviderDef,
+  apiKey: string,
+  force: boolean,
+): Promise<{ models: ProviderModelConfig[]; source: "live" | "cache" | "unavailable" }> {
   try {
-    return await fetchCloudModels(domain, apiKey, force);
-  } catch (e: any) {
-    const cache = readJSON<CloudCache | null>(CLOUD_CACHE_PATH, null);
-    if (cache?.models?.length && cache.domain === domain) {
-      console.warn(`[alibaba] Cloud catalog fetch failed (${e?.message || e}); using cached models (${cache.models.length}, ${cacheAgeMin(cache.fetchedAt)}m old).`);
-      // Recompute context windows to apply the latest inferContextWindow logic
-      const overrides = loadConfig().contextWindowOverrides;
-      return cache.models.map(m => ({
-        ...m,
-        contextWindow: inferContextWindow(m.id, overrides),
-      }));
+    const models = await fetchCloudModels(provider, apiKey, force);
+    return { models, source: "live" };
+  } catch (e: unknown) {
+    const cache = readJSON<CloudCache | null>(provider.cachePath, null);
+    const message = e instanceof Error ? e.message : String(e);
+    if (cache?.models?.length && cache.domain === provider.domain) {
+      console.warn(`[alibaba] ${provider.name} catalog fetch failed (${message}); using cached models (${cache.models.length}, ${cacheAgeMin(cache.fetchedAt)}m old).`);
+      return { models: cache.models, source: "cache" };
     }
-    console.warn(`[alibaba] Cloud catalog fetch failed (${e?.message || e}); no cache — Cloud models unavailable until reconnected. Other providers still work.`);
-    return [];
+    console.warn(`[alibaba] ${provider.name} catalog fetch failed (${message}); no cache — Cloud models unavailable until reconnected. Other providers still work.`);
+    return { models: [], source: "unavailable" };
   }
+}
+
+function createEmptyCloudDefs(): Record<CloudProviderId, ProviderModelConfig[]> {
+  return { alibaba: [], "alibaba-cn": [], "alibaba-global": [] };
+}
+
+async function refreshCloudProvider(provider: CloudProviderDef, force: boolean) {
+  const key = readCloudKey(provider);
+  if (!key) {
+    cloudDefsByProvider[provider.id] = CLOUD_LOGIN_SEED;
+    return { provider, keyPresent: false, count: 0, source: "skipped" as const };
+  }
+  const previousModels = cloudDefsByProvider[provider.id];
+  const result = await loadCloudDefs(provider, key, force);
+  if (result.models.length) {
+    cloudDefsByProvider[provider.id] = result.models;
+    return { provider, keyPresent: true, count: result.models.length, source: result.source };
+  }
+  if (previousModels.length && previousModels !== CLOUD_LOGIN_SEED) {
+    return { provider, keyPresent: true, count: previousModels.length, source: "retained" as const };
+  }
+  cloudDefsByProvider[provider.id] = CLOUD_LOGIN_SEED;
+  return { provider, keyPresent: true, count: 0, source: "unavailable" as const };
+}
+
+async function refreshCloudProviders(force: boolean) {
+  return Promise.all(CLOUD_PROVIDERS.map((provider) => refreshCloudProvider(provider, force)));
+}
+
+function allCloudModelIds(): string[] {
+  return CLOUD_PROVIDERS.flatMap((provider) => cloudDefsByProvider[provider.id].map((model) => model.id));
 }
 
 // ── Module-level mutable model lists ─────────────────────────────────
 // Populated by the async extension factory before provider registration.
 let planDefs: PlanModelDef[] = [];
-let cloudDefs: ProviderModelConfig[] = [];
+const cloudDefsByProvider = createEmptyCloudDefs();
 
 // ── Migration ─────────────────────────────────────────────────────────
-const isPlanKey = (k: string) => k.startsWith("sk-sp-") || k.startsWith("sk-tok-");
+const isPlanKey = (key: string) => key.startsWith("sk-sp-") || key.startsWith("sk-tok-");
 
 function extractKey(entry: any): string | undefined {
   if (!entry || typeof entry !== "object") return undefined;
   return entry.key || entry.access || undefined;
+}
+
+function setPlanAuth(auth: Record<string, any>, key: string) {
+  auth["alibaba-plan"] = auth["alibaba-plan"] ?? {
+    type: "oauth",
+    access: key,
+    refresh: "",
+    expires: Date.now() + 365 * 86400_000,
+  };
 }
 
 function migrateLegacyAuth() {
@@ -464,95 +758,62 @@ function migrateLegacyAuth() {
     const auth = readAuth();
     let dirty = false;
 
-    // 1) Legacy single-key "alibaba" → split by prefix.
-    const old = auth["alibaba"];
-    if (old) {
-      const key = extractKey(old);
-      for (const k of ["alibaba-studio", "alibaba-token", "dashscope"]) {
-        if (k in auth) { delete auth[k]; dirty = true; }
-      }
-      if (!key) {
-        delete auth["alibaba"]; dirty = true;
-      } else {
-        const target = isPlanKey(key) ? "alibaba-plan" : "alibaba-cloud";
-        // Plan stays in oauth shape (it's still oauth-registered);
-        // Cloud must be api_key shape (now api-key-only registered).
-        auth[target] = target === "alibaba-plan"
-          ? { type: "oauth", access: key, refresh: "", expires: Date.now() + 365 * 86400_000 }
-          : { type: "api_key", key };
+    const current = auth["alibaba"];
+    const currentKey = extractKey(current);
+    if (current) {
+      if (!currentKey) {
         delete auth["alibaba"];
         dirty = true;
+      } else if (isPlanKey(currentKey)) {
+        setPlanAuth(auth, currentKey);
+        delete auth["alibaba"];
+        dirty = true;
+      } else if (current.type !== "api_key" || current.key !== currentKey) {
+        auth["alibaba"] = { type: "api_key", key: currentKey };
+        dirty = true;
       }
     }
 
-    // 2) Cloud was previously registered with `oauth` block — credentials were
-    //    saved as {type:"oauth", access:"sk-..."}. Now that cloud is api-key-only,
-    //    pi can't read those credentials. Migrate them in place.
-    const cloud = auth["alibaba-cloud"];
-    if (cloud && cloud.type !== "api_key") {
-      const key = extractKey(cloud);
+    for (const legacyId of ["alibaba-cloud", "alibaba-studio", "alibaba-token", "dashscope"]) {
+      const legacy = auth[legacyId];
+      if (!legacy) continue;
+      const key = extractKey(legacy);
       if (key) {
-        // Defensive: if the cloud slot somehow contains a Plan token, route it.
-        if (isPlanKey(key)) {
-          auth["alibaba-plan"] = auth["alibaba-plan"] ?? {
-            type: "oauth", access: key, refresh: "", expires: Date.now() + 365 * 86400_000,
-          };
-          delete auth["alibaba-cloud"];
-        } else {
-          auth["alibaba-cloud"] = { type: "api_key", key };
-        }
-        dirty = true;
-      } else {
-        delete auth["alibaba-cloud"];
-        dirty = true;
+        if (isPlanKey(key)) setPlanAuth(auth, key);
+        else if (!auth["alibaba"]) auth["alibaba"] = { type: "api_key", key };
       }
-    }
-
-    // 3) Defensive: a misrouted Plan token sitting in alibaba-cloud (api_key shape).
-    //    Plan tokens won't authenticate against the cloud endpoint. Move it.
-    const cloud2 = auth["alibaba-cloud"];
-    if (cloud2?.type === "api_key" && typeof cloud2.key === "string" && isPlanKey(cloud2.key)) {
-      if (!auth["alibaba-plan"]) {
-        auth["alibaba-plan"] = {
-          type: "oauth", access: cloud2.key, refresh: "", expires: Date.now() + 365 * 86400_000,
-        };
-      }
-      delete auth["alibaba-cloud"];
+      delete auth[legacyId];
       dirty = true;
     }
 
+    for (const provider of CLOUD_PROVIDERS) {
+      const cloud = auth[provider.id];
+      if (!cloud) continue;
+      const key = extractKey(cloud);
+      if (!key) {
+        delete auth[provider.id];
+        dirty = true;
+      } else if (isPlanKey(key)) {
+        setPlanAuth(auth, key);
+        delete auth[provider.id];
+        dirty = true;
+      } else if (cloud.type !== "api_key" || cloud.key !== key) {
+        auth[provider.id] = { type: "api_key", key };
+        dirty = true;
+      }
+    }
+
     if (dirty) writeAuth(auth);
-  } catch {}
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : String(e);
+    console.warn(`[alibaba] Credential migration failed (${message}).`);
+  }
 }
 
-// ── Main ──────────────────────────────────────────────────────────────
-// Async factory: pi awaits this before provider registrations are flushed.
-// Fetch live model catalogs before registerProvider() so enabledModels
-// validation sees the real catalog immediately. No fallbacks.
-export default async function (pi: ExtensionAPI) {
-  migrateLegacyAuth();
-  const config = loadConfig();
-
-  let planKey: string | null = null;
-  try {
-    const auth = readAuth();
-    planKey = auth["alibaba-plan"]?.access || auth["alibaba-plan"]?.key || null;
-  } catch {}
-  const cloudKey = readCloudKey();
-
-  // ── Live catalog fetch (before provider registration) ───────────────
-  let planCreds: { access?: string; refresh?: string } | undefined;
-  if (planKey) { try { planCreds = readAuth()["alibaba-plan"]; } catch {} }
-  const planEndpoints = resolvePlanEndpoints(planCreds);
-  const cloudDomain = config.cloudDomain || DEFAULT_CLOUD_DOMAIN;
-  const cloudFmt = config.cloudApiFormat || "anthropic-messages";
-
-  if (planCreds?.access) planDefs = await loadPlanDefs(true, planCreds);
-  if (cloudKey) cloudDefs = await loadCloudDefs(cloudDomain, cloudKey, true);
-  // Keep the Cloud provider visible in /login even with no models yet (issue #1).
-  if (!cloudDefs.length) cloudDefs = CLOUD_LOGIN_SEED;
-
-  // ── Plan provider ───────────────────────────────────────────────────
+function registerPlanProvider(
+  pi: ExtensionAPI,
+  planEndpoints: { openai: string; anthropic: string },
+) {
   pi.registerProvider("alibaba-plan", {
     name: "Alibaba Model Studio Plan",
     baseUrl: planEndpoints.anthropic,
@@ -568,128 +829,76 @@ export default async function (pi: ExtensionAPI) {
         if (!isPlanKey(key)) {
           throw new Error(
             "This doesn't look like a Coding Plan token (expected sk-sp-… or sk-tok-…). " +
-            "If it's a Cloud API key, run /login → 'Alibaba Cloud (API Key)' instead.",
+            "If it's a Cloud API key, run /login and pick the matching Alibaba Cloud region instead.",
           );
         }
-        const cfg = loadConfig();
-        const openaiUrl = cfg.planOpenAI || DEFAULT_PLAN_OPENAI;
-        const anthropicUrl = cfg.planAnthropic || DEFAULT_PLAN_ANTHROPIC;
-        cfg.planOpenAI = openaiUrl;
-        cfg.planAnthropic = anthropicUrl;
-        saveConfig(cfg);
+        const config = loadConfig();
+        const openaiUrl = config.planOpenAI || DEFAULT_PLAN_OPENAI;
+        const anthropicUrl = config.planAnthropic || DEFAULT_PLAN_ANTHROPIC;
+        config.planOpenAI = openaiUrl;
+        config.planAnthropic = anthropicUrl;
+        saveConfig(config);
         return {
           access: key,
           refresh: JSON.stringify({ openai: openaiUrl, anthropic: anthropicUrl }),
           expires: Date.now() + 365 * 86400_000,
         };
       },
-      async refreshToken(c) { return c; },
-      getApiKey(c) { return c.access; },
+      async refreshToken(credentials) { return credentials; },
+      getApiKey(credentials) { return credentials.access; },
       modifyModels(models, credentials) {
-        const ep = resolvePlanEndpoints(credentials);
-        // Always reads the latest planDefs (startup fetch → session_start refresh)
-        const updated = buildPlanModels(planDefs, ep.openai, ep.anthropic);
-        return models.map((m) => {
-          if (m.provider !== "alibaba-plan") return m;
-          const found = updated.find((u) => u.id === m.id);
-          if (!found || !found.api) return m;
-          return { ...m, baseUrl: found.baseUrl ?? m.baseUrl, api: found.api };
+        const endpoints = resolvePlanEndpoints(credentials);
+        const updated = buildPlanModels(planDefs, endpoints.openai, endpoints.anthropic);
+        return models.map((model) => {
+          if (model.provider !== "alibaba-plan") return model;
+          const found = updated.find((candidate) => candidate.id === model.id);
+          if (!found?.api) return model;
+          return { ...model, baseUrl: found.baseUrl ?? model.baseUrl, api: found.api };
         });
       },
     },
   });
+}
 
-  // ── Cloud provider ─────────────────────────────────────────────────
-  pi.registerProvider("alibaba-cloud", {
-    name: "Alibaba Cloud (API Key)",
-    baseUrl: `https://${cloudDomain}/apps/anthropic`,
-    apiKey: "$DASHSCOPE_API_KEY",
-    api: "anthropic-messages",
-    authHeader: true,
-    models: buildCloudModels(cloudDefs, cloudDomain, cloudFmt),
-  });
+// ── Main ──────────────────────────────────────────────────────────────
+export default async function (pi: ExtensionAPI) {
+  migrateLegacyAuth();
+  const config = loadConfig();
 
-  // ── Lazy refresh: fetch live catalogs and re-register ───────────────
+  const planCreds = readAuth()["alibaba-plan"];
+
+  const planEndpoints = resolvePlanEndpoints(planCreds);
+  const cloudFmt = config.cloudApiFormat || "anthropic-messages";
+  await Promise.all([
+    planCreds?.access ? loadPlanDefs(true, planCreds).then((models) => { planDefs = models; }) : Promise.resolve(),
+    refreshCloudProviders(true),
+  ]);
+
+  registerPlanProvider(pi, planEndpoints);
+  registerCloudProviders(pi, cloudDefsByProvider, cloudFmt);
+
   pi.on("session_start", async () => {
-   try {
-    const planCred = readAuth()["alibaba-plan"];
-    planDefs = await loadPlanDefs(false, planCred);
+    try {
+      const planCred = readAuth()["alibaba-plan"];
+      await Promise.all([
+        loadPlanDefs(false, planCred).then((models) => { planDefs = models; }),
+        refreshCloudProviders(false),
+      ]);
 
-    const key = readCloudKey();
-    if (key) {
-      const cfg = loadConfig();
-      const domain = cfg.cloudDomain || DEFAULT_CLOUD_DOMAIN;
-      cloudDefs = await loadCloudDefs(domain, key, false);
+      const currentConfig = loadConfig();
+      const currentPlanCreds = readAuth()["alibaba-plan"];
+      registerPlanProvider(pi, resolvePlanEndpoints(currentPlanCreds));
+      registerCloudProviders(
+        pi,
+        cloudDefsByProvider,
+        currentConfig.cloudApiFormat || "anthropic-messages",
+      );
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      console.warn(`[alibaba] session_start catalog refresh failed (${message}); keeping previously loaded models.`);
     }
-    // Keep the Cloud provider visible in /login even with no models yet (issue #1).
-    if (!cloudDefs.length) cloudDefs = CLOUD_LOGIN_SEED;
-
-    // Re-register both providers with the expanded model lists
-    const currentConfig = loadConfig();
-    const currentPlanCreds = readAuth()["alibaba-plan"];
-    const ep = resolvePlanEndpoints(currentPlanCreds);
-    const currentDomain = currentConfig.cloudDomain || DEFAULT_CLOUD_DOMAIN;
-    const currentFmt = currentConfig.cloudApiFormat || "anthropic-messages";
-
-    pi.registerProvider("alibaba-plan", {
-      name: "Alibaba Model Studio Plan",
-      baseUrl: ep.anthropic,
-      api: "anthropic-messages",
-      authHeader: true,
-      models: buildPlanModels(planDefs, ep.openai, ep.anthropic),
-      oauth: {
-        name: "Alibaba Model Studio Coding Plan",
-        async login(callbacks) {
-          const key = await callbacks.onPrompt({
-            message: "Coding Plan token (sk-sp-… or sk-tok-…). Run /alibaba afterwards if you need a non-Singapore region:",
-          });
-          if (!isPlanKey(key)) {
-            throw new Error(
-              "This doesn't look like a Coding Plan token (expected sk-sp-… or sk-tok-…). " +
-              "If it's a Cloud API key, run /login → 'Alibaba Cloud (API Key)' instead.",
-            );
-          }
-          const cfg = loadConfig();
-          const openaiUrl = cfg.planOpenAI || DEFAULT_PLAN_OPENAI;
-          const anthropicUrl = cfg.planAnthropic || DEFAULT_PLAN_ANTHROPIC;
-          cfg.planOpenAI = openaiUrl;
-          cfg.planAnthropic = anthropicUrl;
-          saveConfig(cfg);
-          return {
-            access: key,
-            refresh: JSON.stringify({ openai: openaiUrl, anthropic: anthropicUrl }),
-            expires: Date.now() + 365 * 86400_000,
-          };
-        },
-        async refreshToken(c) { return c; },
-        getApiKey(c) { return c.access; },
-        modifyModels(models, credentials) {
-          const ep2 = resolvePlanEndpoints(credentials);
-          const updated = buildPlanModels(planDefs, ep2.openai, ep2.anthropic);
-          return models.map((m) => {
-            if (m.provider !== "alibaba-plan") return m;
-            const found = updated.find((u) => u.id === m.id);
-            if (!found || !found.api) return m;
-            return { ...m, baseUrl: found.baseUrl ?? m.baseUrl, api: found.api };
-          });
-        },
-      },
-    });
-
-    pi.registerProvider("alibaba-cloud", {
-      name: "Alibaba Cloud (API Key)",
-      baseUrl: `https://${currentDomain}/apps/anthropic`,
-      apiKey: "$DASHSCOPE_API_KEY",
-      api: "anthropic-messages",
-      authHeader: true,
-      models: buildCloudModels(cloudDefs, currentDomain, currentFmt),
-    });
-   } catch (e: any) {
-    console.warn(`[alibaba] session_start catalog refresh failed (${e?.message || e}); keeping previously loaded models.`);
-   }
   });
 
-  // ── Command: /alibaba ──────────────────────────────────────────────
   pi.registerCommand("alibaba", {
     description: "Manage Alibaba (Plan + Cloud) configuration",
     handler: async (_args, ctx: ExtensionCommandContext) => {
@@ -699,45 +908,61 @@ export default async function (pi: ExtensionAPI) {
         "Re-login Plan",
         "Re-login Cloud",
         "Plan — Change Endpoints",
-        "Cloud — Change Domain",
         "Cloud — Change API Format",
         "Context Window — Override",
         "Reset all",
       ]);
       if (!choice) return;
 
-      const cfg = loadConfig();
+      const config = loadConfig();
       const auth = readAuth();
       const planCred = auth["alibaba-plan"];
-      const cloudCred = auth["alibaba-cloud"];
 
       if (choice === "Status") {
-        const ep = resolvePlanEndpoints(planCred);
+        const endpoints = resolvePlanEndpoints(planCred);
+        const ageMin = (cache: { fetchedAt: number } | null) =>
+          cache ? Math.round((Date.now() - cache.fetchedAt) / 60000) : null;
         const planCache = readJSON<PlanCache | null>(PLAN_CACHE_PATH, null);
-        const cloudCache = readJSON<CloudCache | null>(CLOUD_CACHE_PATH, null);
-        const ageMin = (c: { fetchedAt: number } | null) => c ? Math.round((Date.now() - c.fetchedAt) / 60000) : null;
         const planAge = ageMin(planCache);
-        const cloudAge = ageMin(cloudCache);
-        const isPlanLive = planCache && planAge !== null && planCache.models.length === planDefs.length;
-        const isCloudLive = cloudCache && cloudAge !== null && cloudCache.models.length === cloudDefs.length;
-        const planState = isPlanLive ? `live, ${planAge}m old` : (planDefs.length ? "live, not cached" : "not fetched");
-        const cloudState = isCloudLive ? `live, ${cloudAge}m old` : (cloudDefs.length ? "live, not cached" : "not fetched");
+        const planLive = planCache && planAge !== null && planCache.models.length === planDefs.length;
+        const planState = planLive
+          ? `live, ${planAge}m old`
+          : planDefs.length ? "live, not cached" : "not fetched";
         const lines = [
           `Plan:  ${planCred ? "logged in" : "not logged in"}`,
-          `       Anthropic: ${ep.anthropic}`,
-          `       OpenAI:    ${ep.openai}`,
+          `       Anthropic: ${endpoints.anthropic}`,
+          `       OpenAI:    ${endpoints.openai}`,
           `       Models:    ${planDefs.length} (${planState})`,
-          ``,
-          `Cloud: ${cloudCred ? "logged in" : (process.env.DASHSCOPE_API_KEY ? "via $DASHSCOPE_API_KEY" : "not logged in")}`,
-          `       Domain:    ${cfg.cloudDomain || DEFAULT_CLOUD_DOMAIN}`,
-          `       Format:    ${cfg.cloudApiFormat || "anthropic-messages"}`,
-          `       Models:    ${cloudDefs.length} (${cloudState})`,
         ];
-        const overrides = cfg.contextWindowOverrides;
+
+        for (const provider of CLOUD_PROVIDERS) {
+          const cache = readJSON<CloudCache | null>(provider.cachePath, null);
+          const age = ageMin(cache);
+          const models = cloudDefsByProvider[provider.id];
+          const keyPresent = Boolean(readCloudKey(provider));
+          const modelCount = keyPresent && cache ? models.length : 0;
+          const live = keyPresent && cache && age !== null && cache.models.length === models.length;
+          const state = live ? `live, ${age}m old` : "not fetched";
+          const authState = auth[provider.id]
+            ? "logged in"
+            : process.env[provider.apiKeyEnv]
+              ? `via $${provider.apiKeyEnv}`
+              : "not logged in";
+          lines.push(
+            "",
+            `${provider.name}: ${authState}`,
+            `       Domain:    ${provider.domain}`,
+            `       Env:       $${provider.apiKeyEnv}`,
+            `       Format:    ${config.cloudApiFormat || "anthropic-messages"}`,
+            `       Models:    ${modelCount} (${state})`,
+          );
+        }
+
+        const overrides = config.contextWindowOverrides;
         if (overrides && Object.keys(overrides).length) {
           lines.push("", "Context window overrides:");
-          for (const [id, n] of Object.entries(overrides)) {
-            lines.push(`       ${id}: ${n.toLocaleString()} tokens`);
+          for (const [id, count] of Object.entries(overrides)) {
+            lines.push(`       ${id}: ${count.toLocaleString()} tokens`);
           }
         }
         ctx.ui.notify(lines.join("\n"), "info");
@@ -746,19 +971,24 @@ export default async function (pi: ExtensionAPI) {
 
       if (choice === "Refresh model lists") {
         try {
-          const planCred = readAuth()["alibaba-plan"];
-          planDefs = await loadPlanDefs(true, planCred);
-          let cloudCount = 0;
-          const cloudKey = readCloudKey();
-          if (cloudKey) {
-            const domain = cfg.cloudDomain || DEFAULT_CLOUD_DOMAIN;
-            cloudDefs = await loadCloudDefs(domain, cloudKey, true);
-            cloudCount = cloudDefs.length;
-          }
+          const currentPlanCred = readAuth()["alibaba-plan"];
+          const [, cloudResults] = await Promise.all([
+            loadPlanDefs(true, currentPlanCred).then((models) => { planDefs = models; }),
+            refreshCloudProviders(true),
+          ]);
+          const cloudSummary = cloudResults
+            .map((result) => {
+              if (!result.keyPresent) return `${result.provider.id}: skipped`;
+              if (result.source === "cache") return `${result.provider.id}: ${result.count} cached models`;
+              if (result.source === "retained") return `${result.provider.id}: ${result.count} retained models`;
+              if (result.source === "unavailable") return `${result.provider.id}: unavailable`;
+              return `${result.provider.id}: ${result.count} models`;
+            })
+            .join(", ");
+          ctx.ui.notify(`Plan: ${planDefs.length} models. Cloud: ${cloudSummary}.`, "info");
           await ctx.reload();
-          ctx.ui.notify(`Plan: ${planDefs.length} models. Cloud: ${cloudKey ? `${cloudCount} models` : "skipped (not logged in)"}.`, "info");
-        } catch (e: any) {
-          const message = e?.message || String(e);
+        } catch (e: unknown) {
+          const message = e instanceof Error ? e.message : String(e);
           console.error(`[alibaba] Refresh model lists failed: ${message}`);
           ctx.ui.notify(`Refresh failed: ${message}. Full error was logged to the terminal.`, "error");
         }
@@ -767,8 +997,6 @@ export default async function (pi: ExtensionAPI) {
 
       if (choice === "Re-login Plan") {
         if (!await ctx.ui.confirm("Wipe Plan credentials and re-login?", "Removes alibaba-plan from auth.json")) return;
-        // Use authStorage.remove() rather than fs.write — it persists AND updates pi's
-        // in-memory credential map, so /login's `• configured` label refreshes without restart.
         ctx.modelRegistry.authStorage.remove("alibaba-plan");
         ctx.ui.notify("Plan credentials wiped. Run /login → Alibaba Model Studio Coding Plan.", "info");
         await ctx.reload();
@@ -776,27 +1004,38 @@ export default async function (pi: ExtensionAPI) {
       }
 
       if (choice === "Re-login Cloud") {
-        if (!await ctx.ui.confirm("Wipe Cloud credentials and re-login?", "Removes alibaba-cloud from auth.json")) return;
-        ctx.modelRegistry.authStorage.remove("alibaba-cloud");
-        ctx.ui.notify("Cloud credentials wiped. Run /login → Use an API key → Alibaba Cloud (API Key).", "info");
+        const providerName = await ctx.ui.select(
+          "Cloud provider:",
+          CLOUD_PROVIDERS.map((provider) => provider.name),
+        );
+        if (!providerName) return;
+        const provider = CLOUD_PROVIDERS.find((candidate) => candidate.name === providerName);
+        if (!provider) return;
+        if (!await ctx.ui.confirm(
+          `Wipe ${provider.name} credentials and re-login?`,
+          `Removes ${provider.id} from auth.json`,
+        )) return;
+        ctx.modelRegistry.authStorage.remove(provider.id);
+        ctx.ui.notify(
+          `${provider.name} credentials wiped. Run /login → Use an API key → ${provider.name}.`,
+          "info",
+        );
         await ctx.reload();
         return;
       }
 
       if (choice === "Plan — Change Endpoints") {
-        const o = (await ctx.ui.input("OpenAI-compat base URL:")) || "";
-        const a = (await ctx.ui.input("Anthropic-compat base URL:")) || "";
-        if (o && a) {
-          cfg.planOpenAI = o; cfg.planAnthropic = a; saveConfig(cfg);
-          // Also rewrite the active credential's refresh-blob so resolvePlanEndpoints
-          // (which prefers credentials.refresh over config) picks up the new endpoints
-          // for the existing logged-in session — otherwise the change only takes effect
-          // after the user logs out + back in.
+        const openaiUrl = (await ctx.ui.input("OpenAI-compat base URL:")) || "";
+        const anthropicUrl = (await ctx.ui.input("Anthropic-compat base URL:")) || "";
+        if (openaiUrl && anthropicUrl) {
+          config.planOpenAI = openaiUrl;
+          config.planAnthropic = anthropicUrl;
+          saveConfig(config);
           const currentPlan = ctx.modelRegistry.authStorage.get("alibaba-plan");
           if (currentPlan?.type === "oauth") {
             ctx.modelRegistry.authStorage.set("alibaba-plan", {
               ...currentPlan,
-              refresh: JSON.stringify({ openai: o, anthropic: a }),
+              refresh: JSON.stringify({ openai: openaiUrl, anthropic: anthropicUrl }),
             });
           }
           ctx.ui.notify("Plan endpoints updated.", "info");
@@ -805,93 +1044,65 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      if (choice === "Cloud — Change Domain") {
-        const endpoints = [
-          { label: "Singapore: https://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1", domain: "{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com" },
-          { label: "US (Virginia): https://dashscope-us.aliyuncs.com/compatible-mode/v1", domain: "dashscope-us.aliyuncs.com" },
-          { label: "China (Beijing): https://dashscope.aliyuncs.com/compatible-mode/v1", domain: "dashscope.aliyuncs.com" },
-          { label: "China (Hong Kong): https://{WorkspaceId}.cn-hongkong.maas.aliyuncs.com/compatible-mode/v1", domain: "{WorkspaceId}.cn-hongkong.maas.aliyuncs.com" },
-          { label: "Germany (Frankfurt): https://{WorkspaceId}.eu-central-1.maas.aliyuncs.com/compatible-mode/v1", domain: "{WorkspaceId}.eu-central-1.maas.aliyuncs.com" },
-          { label: "Custom…", domain: "" },
-        ];
-        const sel = await ctx.ui.select("Cloud endpoint:", endpoints.map((e) => e.label));
-        if (!sel) return;
-        const endpoint = endpoints.find((e) => e.label === sel);
-        let domain = endpoint?.domain || "";
-        if (sel.startsWith("Custom")) domain = (await ctx.ui.input("Cloud domain:")) || "";
-        if (domain.includes("{WorkspaceId}")) {
-          const workspaceId = (await ctx.ui.input("Workspace ID:")) || "";
-          if (!workspaceId) return;
-          domain = domain.replace("{WorkspaceId}", workspaceId);
-        }
-        if (domain) {
-          cfg.cloudDomain = domain; saveConfig(cfg);
-          ctx.ui.notify(`Cloud domain: ${domain}`, "info");
-          await ctx.reload();
-        }
-        return;
-      }
-
       if (choice === "Cloud — Change API Format") {
-        const sel = await ctx.ui.select("Cloud API format:", ["Anthropic (recommended)", "OpenAI"]);
-        if (!sel) return;
-        cfg.cloudApiFormat = sel.startsWith("OpenAI") ? "openai-completions" : "anthropic-messages";
-        saveConfig(cfg);
-        ctx.ui.notify(`Cloud format: ${cfg.cloudApiFormat}`, "info");
+        const selected = await ctx.ui.select("Cloud API format:", ["Anthropic (recommended)", "OpenAI"]);
+        if (!selected) return;
+        config.cloudApiFormat = selected.startsWith("OpenAI") ? "openai-completions" : "anthropic-messages";
+        saveConfig(config);
+        ctx.ui.notify(`Cloud format: ${config.cloudApiFormat}`, "info");
         await ctx.reload();
         return;
       }
 
       if (choice === "Context Window — Override") {
-        // Override the context-window shown on a model's card (e.g. when the
-        // inferred size is wrong for a brand-new model). Pick a model id, or
-        // "*" to set a default for every model without its own override.
-        const ov = cfg.contextWindowOverrides || {};
-        const fmt = (n: number) => n.toLocaleString();
-        const ids = Array.from(new Set([...planDefs.map((m) => m.id), ...cloudDefs.map((m) => m.id)])).sort();
+        const overrides = config.contextWindowOverrides || {};
+        const format = (count: number) => count.toLocaleString();
+        const ids = Array.from(new Set([...planDefs.map((model) => model.id), ...allCloudModelIds()])).sort();
         const labelToId = new Map<string, string>();
-        const opts: string[] = [];
+        const options: string[] = [];
         for (const id of ids) {
-          const label = ov[id] ? `${id}  (override: ${fmt(ov[id])})` : id;
+          const label = overrides[id] ? `${id}  (override: ${format(overrides[id])})` : id;
           labelToId.set(label, id);
-          opts.push(label);
+          options.push(label);
         }
-        const allLabel = ov["*"] ? `* every other model  (override: ${fmt(ov["*"])})` : "* every other model";
+        const allLabel = overrides["*"]
+          ? `* every other model  (override: ${format(overrides["*"])})`
+          : "* every other model";
         labelToId.set(allLabel, "*");
-        opts.push(allLabel);
-        const CLEAR = "Clear all overrides";
-        opts.push(CLEAR);
+        options.push(allLabel);
+        const clear = "Clear all overrides";
+        options.push(clear);
 
-        const sel = await ctx.ui.select("Override context window for:", opts);
-        if (!sel) return;
-        if (sel === CLEAR) {
-          delete cfg.contextWindowOverrides;
-          saveConfig(cfg);
+        const selected = await ctx.ui.select("Override context window for:", options);
+        if (!selected) return;
+        if (selected === clear) {
+          delete config.contextWindowOverrides;
+          saveConfig(config);
           ctx.ui.notify("Cleared all context-window overrides.", "info");
           await ctx.reload();
           return;
         }
-        const id = labelToId.get(sel) ?? sel;
-        const current = ov[id];
-        const val = (await ctx.ui.input(
-          `Context window for ${id} in tokens — e.g. 1048576 (0 to remove)${current ? `; currently ${fmt(current)}` : ""}:`,
+        const id = labelToId.get(selected) ?? selected;
+        const current = overrides[id];
+        const value = (await ctx.ui.input(
+          `Context window for ${id} in tokens — e.g. 1048576 (0 to remove)${current ? `; currently ${format(current)}` : ""}:`,
         ))?.trim();
-        if (!val) return; // cancelled / left blank → no change
-        const n = Number(val.replace(/[_,\s]/g, ""));
-        if (!Number.isFinite(n) || n < 0) {
-          ctx.ui.notify("Enter a non-negative number of tokens (0 removes the override).", "error");
+        if (!value) return;
+        const count = Number(value.replace(/[_,\s]/g, ""));
+        if (!Number.isSafeInteger(count) || count < 0) {
+          ctx.ui.notify("Enter a non-negative whole number of tokens (0 removes the override).", "error");
           return;
         }
-        cfg.contextWindowOverrides = cfg.contextWindowOverrides || {};
-        if (n === 0) {
-          delete cfg.contextWindowOverrides[id];
+        config.contextWindowOverrides = config.contextWindowOverrides || {};
+        if (count === 0) {
+          delete config.contextWindowOverrides[id];
           ctx.ui.notify(`Removed context-window override for ${id}.`, "info");
         } else {
-          cfg.contextWindowOverrides[id] = Math.floor(n);
-          ctx.ui.notify(`Context window for ${id} set to ${fmt(Math.floor(n))} tokens.`, "info");
+          config.contextWindowOverrides[id] = count;
+          ctx.ui.notify(`Context window for ${id} set to ${format(count)} tokens.`, "info");
         }
-        if (Object.keys(cfg.contextWindowOverrides).length === 0) delete cfg.contextWindowOverrides;
-        saveConfig(cfg);
+        if (Object.keys(config.contextWindowOverrides).length === 0) delete config.contextWindowOverrides;
+        saveConfig(config);
         await ctx.reload();
         return;
       }
@@ -899,38 +1110,59 @@ export default async function (pi: ExtensionAPI) {
       if (choice === "Reset all") {
         if (!await ctx.ui.confirm(
           "Reset all Alibaba settings?",
-          "Wipes config, both auth entries, plan-models cache, cloud-models cache, models.dev cache, and any alibaba-* entries in settings.json (enabledModels + defaultProvider/defaultModel if alibaba). Run before `pi remove` for a clean uninstall.",
+          "Wipes config, Plan auth, regional Cloud auth entries, all model caches, and Alibaba entries in settings.json.",
         )) return;
-        for (const p of [CONFIG_PATH, PLAN_CACHE_PATH, CLOUD_CACHE_PATH, MODELS_DEV_CACHE_PATH]) { try { fs.unlinkSync(p); } catch {} }
-        // Use authStorage.remove() so pi's in-memory credential cache stays in sync —
-        // otherwise /login's "• configured" label persists until pi is restarted.
-        for (const k of ["alibaba", "alibaba-plan", "alibaba-cloud", "alibaba-studio", "alibaba-token", "dashscope"]) {
-          ctx.modelRegistry.authStorage.remove(k);
+        for (const cachePath of [
+          CONFIG_PATH,
+          PLAN_CACHE_PATH,
+          MODELS_DEV_CACHE_PATH,
+          ...CLOUD_PROVIDERS.map((provider) => provider.cachePath),
+        ]) {
+          unlinkIfExists(cachePath);
         }
-        // Also strip stale alibaba-* / dashscope-* model ids from settings.json enabledModels,
-        // and clear defaultProvider/defaultModel if they reference alibaba (otherwise pi would
-        // try to default-launch into a now-missing provider).
+        for (const key of [
+          ...CLOUD_PROVIDER_IDS,
+          "alibaba-plan",
+          "alibaba-cloud",
+          "alibaba-studio",
+          "alibaba-token",
+          "dashscope",
+        ]) {
+          ctx.modelRegistry.authStorage.remove(key);
+        }
+        let settingsCleanupFailed = false;
         try {
-          const SETTINGS_PATH = path.join(HOME_DIR, "settings.json");
-          const s = readJSON<Record<string, any>>(SETTINGS_PATH, {});
+          const settings = readJSON<Record<string, unknown>>(SETTINGS_PATH, {});
           let touched = false;
-          if (Array.isArray(s.enabledModels)) {
-            const before = s.enabledModels.length;
-            s.enabledModels = s.enabledModels.filter((id: string) =>
-              typeof id === "string" && !/^(alibaba(-plan|-cloud|-studio|-token)?|dashscope)\//.test(id),
+          if (Array.isArray(settings.enabledModels)) {
+            const before = settings.enabledModels.length;
+            const enabledModels = settings.enabledModels.filter(
+              (id) => typeof id === "string" && !/^(alibaba(-plan|-cloud|-cn|-global|-studio|-token)?|dashscope)\//.test(id),
             );
-            if (s.enabledModels.length !== before) touched = true;
+            settings.enabledModels = enabledModels;
+            if (enabledModels.length !== before) touched = true;
           }
-          if (typeof s.defaultProvider === "string" && /^(alibaba(-plan|-cloud|-studio|-token)?|dashscope)$/.test(s.defaultProvider)) {
-            delete s.defaultProvider;
-            delete s.defaultModel;
+          if (
+            typeof settings.defaultProvider === "string" &&
+            /^(alibaba(-plan|-cloud|-cn|-global|-studio|-token)?|dashscope)$/.test(settings.defaultProvider)
+          ) {
+            delete settings.defaultProvider;
+            delete settings.defaultModel;
             touched = true;
           }
-          if (touched) writeJSON(SETTINGS_PATH, s);
-        } catch {}
-        ctx.ui.notify("All Alibaba settings wiped. Now safe to `pi remove`.", "info");
+          if (touched) writeJSON(SETTINGS_PATH, settings);
+        } catch (e: unknown) {
+          settingsCleanupFailed = true;
+          const message = e instanceof Error ? e.message : String(e);
+          console.warn(`[alibaba] Settings cleanup failed (${message}).`);
+        }
+        ctx.ui.notify(
+          settingsCleanupFailed
+            ? "Auth and caches reset, but settings cleanup failed. Repair settings.json before removing extension."
+            : "All Alibaba settings wiped. Now safe to `pi remove`.",
+          settingsCleanupFailed ? "error" : "info",
+        );
         await ctx.reload();
-        return;
       }
     },
   });
