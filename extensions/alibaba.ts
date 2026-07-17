@@ -142,7 +142,8 @@ function parseModelsDevJSON(json: any): Map<string, ModelsDevEntry> {
   return models;
 }
 
-async function fetchModelsDevRegistry(): Promise<Map<string, ModelsDevEntry>> {
+async function fetchModelsDevRegistry(signal?: AbortSignal): Promise<Map<string, ModelsDevEntry>> {
+  signal?.throwIfAborted();
   // Return cached version if fresh
   if (modelsDevCache && Date.now() - modelsDevCache.fetchedAt < MODELS_DEV_CACHE_TTL_MS) {
     return modelsDevCache.models;
@@ -160,13 +161,15 @@ async function fetchModelsDevRegistry(): Promise<Map<string, ModelsDevEntry>> {
 
   // Fetch from models.dev
   try {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 5000);
-    const res = await fetch(MODELS_DEV_API_URL, { signal: ctrl.signal });
-    clearTimeout(t);
-    
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const json = await res.json();
+    const json = await fetchWithTimeout(
+      async (requestSignal) => {
+        const res = await fetch(MODELS_DEV_API_URL, { signal: requestSignal });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      },
+      5000,
+      signal,
+    );
     
     // Parse the JSON to extract model data
     const models = parseModelsDevJSON(json);
@@ -176,6 +179,7 @@ async function fetchModelsDevRegistry(): Promise<Map<string, ModelsDevEntry>> {
     }
     
     // Cache to memory and disk
+    signal?.throwIfAborted();
     modelsDevCache = { fetchedAt: Date.now(), models };
     writeJSON(MODELS_DEV_CACHE_PATH, {
       fetchedAt: modelsDevCache.fetchedAt,
@@ -184,6 +188,7 @@ async function fetchModelsDevRegistry(): Promise<Map<string, ModelsDevEntry>> {
     
     return models;
   } catch (e: any) {
+    if (signal?.aborted) throw e;
     console.warn(`[alibaba] Failed to fetch models.dev registry (${e?.message || e}); skipping enrichment.`);
     return new Map();
   }
@@ -263,33 +268,38 @@ function inferPlanDef(id: string, overrides?: Record<string, number>, devEntry?:
 }
 
 // Primary source: the Plan endpoint's own /compatible-mode/v1/models.
-async function fetchPlanModelsFromAPI(credentials?: { access?: string; refresh?: string }): Promise<PlanModelDef[]> {
+async function fetchPlanModelsFromAPI(
+  credentials?: { access?: string; refresh?: string },
+  signal?: AbortSignal,
+): Promise<PlanModelDef[]> {
   const key = credentials?.access;
   if (!key) return [];
   const ep = resolvePlanEndpoints(credentials);
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 5000);
-  try {
-    const res = await fetch(`${ep.openai}/models`, {
-      headers: { Authorization: `Bearer ${key}` },
-      signal: ctrl.signal,
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const json = (await res.json()) as { data?: { id: string }[] };
-    if (!json.data?.length) throw new Error("No models in response");
-    // Filter out image/audio/etc — only keep chat-capable models.
-    const exclude = /(image|audio|video|tts|asr|embed|vector|rerank|wan|omni|livetranslate|realtime)/i;
-    const overrides = loadConfig().contextWindowOverrides;
-    
-    // Filter against models.dev registry and enrich with its data
-    const registry = await fetchModelsDevRegistry();
-    const filteredModels = json.data
-      .filter((m) => !exclude.test(m.id))
-      .filter((m) => !isDateSuffixed(m.id)) // Always filter date-suffixed variants
-      .filter((m) => registry.size === 0 || registry.has(m.id)); // Allowlist when registry available
-    
-    return filteredModels.map((m) => inferPlanDef(m.id, overrides, registry.get(m.id)));
-  } finally { clearTimeout(t); }
+  const json = await fetchWithTimeout(
+    async (requestSignal) => {
+      const res = await fetch(`${ep.openai}/models`, {
+        headers: { Authorization: `Bearer ${key}` },
+        signal: requestSignal,
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json() as Promise<{ data?: { id: string }[] }>;
+    },
+    5000,
+    signal,
+  );
+  if (!json.data?.length) throw new Error("No models in response");
+  // Filter out image/audio/etc — only keep chat-capable models.
+  const exclude = /(image|audio|video|tts|asr|embed|vector|rerank|wan|omni|livetranslate|realtime)/i;
+  const overrides = loadConfig().contextWindowOverrides;
+
+  // Filter against models.dev registry and enrich with its data
+  const registry = await fetchModelsDevRegistry(signal);
+  const filteredModels = json.data
+    .filter((m) => !exclude.test(m.id))
+    .filter((m) => !isDateSuffixed(m.id)) // Always filter date-suffixed variants
+    .filter((m) => registry.size === 0 || registry.has(m.id)); // Allowlist when registry available
+
+  return filteredModels.map((m) => inferPlanDef(m.id, overrides, registry.get(m.id)));
 }
 
 function prettyName(id: string): string {
@@ -304,10 +314,15 @@ function prettyName(id: string): string {
   return id;
 }
 
-async function fetchPlanModels(_force = false, credentials?: { access?: string; refresh?: string }): Promise<PlanModelDef[]> {
+async function fetchPlanModels(
+  _force = false,
+  credentials?: { access?: string; refresh?: string },
+  signal?: AbortSignal,
+): Promise<PlanModelDef[]> {
   if (!credentials?.access) return [];
-  const apiModels = await fetchPlanModelsFromAPI(credentials);
+  const apiModels = await fetchPlanModelsFromAPI(credentials, signal);
   if (!apiModels.length) throw new Error("Plan model fetch returned no chat models");
+  signal?.throwIfAborted();
   const ep = resolvePlanEndpoints(credentials);
   const cache: PlanCache = { fetchedAt: Date.now(), source: `${ep.openai}/models`, models: apiModels };
   writeJSON(PLAN_CACHE_PATH, cache);
@@ -499,31 +514,43 @@ async function fetchRichCloudModelRows(
 async function fetchWithTimeout<T>(
   fetcher: (signal: AbortSignal) => Promise<T>,
   timeoutMs: number,
+  externalSignal?: AbortSignal,
 ): Promise<T> {
+  if (externalSignal?.aborted) throw externalSignal.reason;
   const ctrl = new AbortController();
+  const abort = () => ctrl.abort(externalSignal?.reason);
+  externalSignal?.addEventListener("abort", abort, { once: true });
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     return await fetcher(ctrl.signal);
   } finally {
     clearTimeout(t);
+    externalSignal?.removeEventListener("abort", abort);
   }
 }
 
-async function fetchCloudModelRows(provider: CloudProviderDef, apiKey: string): Promise<CloudModelRow[]> {
+async function fetchCloudModelRows(
+  provider: CloudProviderDef,
+  apiKey: string,
+  signal?: AbortSignal,
+): Promise<CloudModelRow[]> {
   try {
     const rows = await fetchWithTimeout(
       (signal) => fetchRichCloudModelRows(provider, apiKey, signal),
       CLOUD_RICH_FETCH_TIMEOUT_MS,
+      signal,
     );
     if (!rows.length) throw new Error("Rich catalog returned no models");
     return rows;
   } catch (e: unknown) {
+    if (signal?.aborted) throw e;
     const message = e instanceof Error ? e.message : String(e);
     console.warn(`[alibaba] ${provider.name} rich catalog failed (${message}); trying compatible-mode /v1/models.`);
   }
   return fetchWithTimeout(
     (signal) => fetchCompatibleCloudModelRows(provider, apiKey, signal),
     CLOUD_COMPAT_FETCH_TIMEOUT_MS,
+    signal,
   );
 }
 
@@ -531,12 +558,13 @@ async function fetchCloudModels(
   provider: CloudProviderDef,
   apiKey: string,
   _force = false,
+  signal?: AbortSignal,
 ): Promise<ProviderModelConfig[]> {
-  const rows = await fetchCloudModelRows(provider, apiKey);
+  const rows = await fetchCloudModelRows(provider, apiKey, signal);
   if (!rows.length) throw new Error("No models");
   const exclude = /(image|audio|video|tts|asr|embed|vector|rerank|wan|omni|livetranslate|realtime)/i;
   const overrides = loadConfig().contextWindowOverrides;
-  const registry = await fetchModelsDevRegistry();
+  const registry = await fetchModelsDevRegistry(signal);
 
   const models = rows
     .filter((model) => !exclude.test(model.id))
@@ -582,6 +610,7 @@ async function fetchCloudModels(
       };
     });
   if (!models.length) throw new Error("Cloud catalog returned no supported chat models");
+  signal?.throwIfAborted();
   const cache: CloudCache = { fetchedAt: Date.now(), domain: provider.domain, models };
   writeJSON(provider.cachePath, cache);
   return models;
@@ -653,27 +682,43 @@ const CLOUD_LOGIN_SEED: ProviderModelConfig[] = [{
 }];
 
 // ── Offline-resilient catalog loaders ────────────────────────────────
-// Live API is the source of truth. But a network failure must never take
-// the whole extension (and therefore pi, and the user's local models) down
-// with it. So: try live, fall back to the last-known-good on-disk cache,
-// warn, and never throw. Cache is an offline fallback only — when the API
-// is reachable, its response always wins and overwrites the cache.
+// Startup reads cache synchronously; live refresh happens after providers register.
 const cacheAgeMin = (fetchedAt: number) => Math.round((Date.now() - fetchedAt) / 60000);
 
-async function loadPlanDefs(force: boolean, credentials?: { access?: string; refresh?: string }): Promise<PlanModelDef[]> {
+function readCachedPlanDefs(credentials?: { access?: string; refresh?: string }): PlanModelDef[] {
+  const cache = readJSON<PlanCache | null>(PLAN_CACHE_PATH, null);
+  if (!cache?.models?.length) return [];
+  if (credentials) {
+    const expectedSource = `${resolvePlanEndpoints(credentials).openai}/models`;
+    if (cache.source !== expectedSource) return [];
+  }
+  const overrides = loadConfig().contextWindowOverrides;
+  return cache.models.map((model) => ({
+    ...model,
+    contextWindow: overrides?.[model.id] ?? overrides?.["*"] ?? model.contextWindow,
+  }));
+}
+
+function readCachedCloudDefs(provider: CloudProviderDef): ProviderModelConfig[] {
+  const cache = readJSON<CloudCache | null>(provider.cachePath, null);
+  return cache?.models?.length && cache.domain === provider.domain ? cache.models : [];
+}
+
+async function loadPlanDefs(
+  force: boolean,
+  credentials?: { access?: string; refresh?: string },
+  signal?: AbortSignal,
+): Promise<PlanModelDef[]> {
   if (!credentials?.access) return [];
   try {
-    return await fetchPlanModels(force, credentials);
+    return await fetchPlanModels(force, credentials, signal);
   } catch (e: any) {
+    if (signal?.aborted) throw e;
     const cache = readJSON<PlanCache | null>(PLAN_CACHE_PATH, null);
-    if (cache?.models?.length) {
-      console.warn(`[alibaba] Plan catalog fetch failed (${e?.message || e}); using cached models (${cache.models.length}, ${cacheAgeMin(cache.fetchedAt)}m old).`);
-      // Recompute context windows to apply the latest inferContextWindow logic
-      const overrides = loadConfig().contextWindowOverrides;
-      return cache.models.map(m => ({
-        ...m,
-        contextWindow: inferContextWindow(m.id, overrides),
-      }));
+    const cachedModels = readCachedPlanDefs(credentials);
+    if (cache && cachedModels.length) {
+      console.warn(`[alibaba] Plan catalog fetch failed (${e?.message || e}); using cached models (${cachedModels.length}, ${cacheAgeMin(cache.fetchedAt)}m old).`);
+      return cachedModels;
     }
     console.warn(`[alibaba] Plan catalog fetch failed (${e?.message || e}); no cache — Plan models unavailable until reconnected. Other providers still work.`);
     return [];
@@ -684,16 +729,19 @@ async function loadCloudDefs(
   provider: CloudProviderDef,
   apiKey: string,
   force: boolean,
+  signal?: AbortSignal,
 ): Promise<{ models: ProviderModelConfig[]; source: "live" | "cache" | "unavailable" }> {
   try {
-    const models = await fetchCloudModels(provider, apiKey, force);
+    const models = await fetchCloudModels(provider, apiKey, force, signal);
     return { models, source: "live" };
   } catch (e: unknown) {
+    if (signal?.aborted) throw e;
     const cache = readJSON<CloudCache | null>(provider.cachePath, null);
+    const cachedModels = readCachedCloudDefs(provider);
     const message = e instanceof Error ? e.message : String(e);
-    if (cache?.models?.length && cache.domain === provider.domain) {
-      console.warn(`[alibaba] ${provider.name} catalog fetch failed (${message}); using cached models (${cache.models.length}, ${cacheAgeMin(cache.fetchedAt)}m old).`);
-      return { models: cache.models, source: "cache" };
+    if (cache && cachedModels.length) {
+      console.warn(`[alibaba] ${provider.name} catalog fetch failed (${message}); using cached models (${cachedModels.length}, ${cacheAgeMin(cache.fetchedAt)}m old).`);
+      return { models: cachedModels, source: "cache" };
     }
     console.warn(`[alibaba] ${provider.name} catalog fetch failed (${message}); no cache — Cloud models unavailable until reconnected. Other providers still work.`);
     return { models: [], source: "unavailable" };
@@ -704,27 +752,50 @@ function createEmptyCloudDefs(): Record<CloudProviderId, ProviderModelConfig[]> 
   return { alibaba: [], "alibaba-cn": [], "alibaba-global": [] };
 }
 
-async function refreshCloudProvider(provider: CloudProviderDef, force: boolean) {
+async function refreshCloudProvider(
+  provider: CloudProviderDef,
+  previousModels: ProviderModelConfig[],
+  force: boolean,
+  signal?: AbortSignal,
+) {
   const key = readCloudKey(provider);
   if (!key) {
-    cloudDefsByProvider[provider.id] = CLOUD_LOGIN_SEED;
-    return { provider, keyPresent: false, count: 0, source: "skipped" as const };
+    const models = previousModels.length ? previousModels : CLOUD_LOGIN_SEED;
+    return { provider, keyPresent: false, count: 0, source: "skipped" as const, models };
   }
-  const previousModels = cloudDefsByProvider[provider.id];
-  const result = await loadCloudDefs(provider, key, force);
+  const result = await loadCloudDefs(provider, key, force, signal);
+  signal?.throwIfAborted();
   if (result.models.length) {
-    cloudDefsByProvider[provider.id] = result.models;
-    return { provider, keyPresent: true, count: result.models.length, source: result.source };
+    return {
+      provider,
+      keyPresent: true,
+      count: result.models.length,
+      source: result.source,
+      models: result.models,
+    };
   }
   if (previousModels.length && previousModels !== CLOUD_LOGIN_SEED) {
-    return { provider, keyPresent: true, count: previousModels.length, source: "retained" as const };
+    return {
+      provider,
+      keyPresent: true,
+      count: previousModels.length,
+      source: "retained" as const,
+      models: previousModels,
+    };
   }
-  cloudDefsByProvider[provider.id] = CLOUD_LOGIN_SEED;
-  return { provider, keyPresent: true, count: 0, source: "unavailable" as const };
+  return {
+    provider,
+    keyPresent: true,
+    count: 0,
+    source: "unavailable" as const,
+    models: CLOUD_LOGIN_SEED,
+  };
 }
 
-async function refreshCloudProviders(force: boolean) {
-  return Promise.all(CLOUD_PROVIDERS.map((provider) => refreshCloudProvider(provider, force)));
+async function refreshCloudProviders(force: boolean, signal?: AbortSignal) {
+  return Promise.all(CLOUD_PROVIDERS.map((provider) =>
+    refreshCloudProvider(provider, cloudDefsByProvider[provider.id], force, signal),
+  ));
 }
 
 function allCloudModelIds(): string[] {
@@ -732,7 +803,7 @@ function allCloudModelIds(): string[] {
 }
 
 // ── Module-level mutable model lists ─────────────────────────────────
-// Populated by the async extension factory before provider registration.
+// Hydrated from disk before provider registration, then refreshed in the background.
 let planDefs: PlanModelDef[] = [];
 const cloudDefsByProvider = createEmptyCloudDefs();
 
@@ -866,37 +937,94 @@ export default async function (pi: ExtensionAPI) {
   const config = loadConfig();
 
   const planCreds = readAuth()["alibaba-plan"];
+  planDefs = planCreds?.access ? readCachedPlanDefs(planCreds) : [];
+  for (const provider of CLOUD_PROVIDERS) {
+    const cachedModels = readCloudKey(provider) ? readCachedCloudDefs(provider) : [];
+    cloudDefsByProvider[provider.id] = cachedModels.length ? cachedModels : CLOUD_LOGIN_SEED;
+  }
 
-  const planEndpoints = resolvePlanEndpoints(planCreds);
-  const cloudFmt = config.cloudApiFormat || "anthropic-messages";
-  await Promise.all([
-    planCreds?.access ? loadPlanDefs(true, planCreds).then((models) => { planDefs = models; }) : Promise.resolve(),
-    refreshCloudProviders(true),
-  ]);
+  registerPlanProvider(pi, resolvePlanEndpoints(planCreds));
+  registerCloudProviders(pi, cloudDefsByProvider, config.cloudApiFormat || "anthropic-messages");
 
-  registerPlanProvider(pi, planEndpoints);
-  registerCloudProviders(pi, cloudDefsByProvider, cloudFmt);
+  const credentialSnapshot = () => {
+    const auth = readAuth();
+    const plan = auth["alibaba-plan"];
+    return JSON.stringify([
+      plan?.access,
+      plan?.refresh,
+      ...CLOUD_PROVIDERS.map((provider) => readCloudKey(provider)),
+    ]);
+  };
 
-  pi.on("session_start", async () => {
-    try {
-      const planCred = readAuth()["alibaba-plan"];
-      await Promise.all([
-        loadPlanDefs(false, planCred).then((models) => { planDefs = models; }),
-        refreshCloudProviders(false),
-      ]);
-
-      const currentConfig = loadConfig();
-      const currentPlanCreds = readAuth()["alibaba-plan"];
-      registerPlanProvider(pi, resolvePlanEndpoints(currentPlanCreds));
-      registerCloudProviders(
-        pi,
-        cloudDefsByProvider,
-        currentConfig.cloudApiFormat || "anthropic-messages",
-      );
-    } catch (e: unknown) {
-      const message = e instanceof Error ? e.message : String(e);
-      console.warn(`[alibaba] session_start catalog refresh failed (${message}); keeping previously loaded models.`);
+  const refreshCatalogs = async (
+    force: boolean,
+    signal?: AbortSignal,
+    expectedCredentialSnapshot?: string,
+  ) => {
+    const currentPlanCreds = readAuth()["alibaba-plan"];
+    const [nextPlanDefs, cloudResults] = await Promise.all([
+      currentPlanCreds?.access
+        ? loadPlanDefs(force, currentPlanCreds, signal)
+        : Promise.resolve(planDefs),
+      refreshCloudProviders(force, signal),
+    ]);
+    signal?.throwIfAborted();
+    if (
+      expectedCredentialSnapshot !== undefined &&
+      credentialSnapshot() !== expectedCredentialSnapshot
+    ) {
+      throw new Error("Alibaba credentials changed during catalog refresh");
     }
+    planDefs = nextPlanDefs;
+    for (const result of cloudResults) {
+      cloudDefsByProvider[result.provider.id] = result.models;
+    }
+    const currentConfig = loadConfig();
+    registerPlanProvider(pi, resolvePlanEndpoints(currentPlanCreds));
+    registerCloudProviders(
+      pi,
+      cloudDefsByProvider,
+      currentConfig.cloudApiFormat || "anthropic-messages",
+    );
+    return cloudResults;
+  };
+
+  let sessionAbort: AbortController | null = null;
+  let backgroundRefresh: ReturnType<typeof refreshCatalogs> | null = null;
+  let backgroundCredentialSnapshot: string | null = null;
+  const startRefresh = (force: boolean, logDetachedFailure: boolean) => {
+    const controller = new AbortController();
+    const snapshot = credentialSnapshot();
+    const refresh = refreshCatalogs(force, controller.signal, snapshot);
+    sessionAbort = controller;
+    backgroundRefresh = refresh;
+    backgroundCredentialSnapshot = snapshot;
+    void refresh
+      .then(undefined, (e: unknown) => {
+        if (logDetachedFailure && !controller.signal.aborted) {
+          const message = e instanceof Error ? e.message : String(e);
+          console.warn(`[alibaba] session_start catalog refresh failed (${message}); keeping previously loaded models.`);
+        }
+      })
+      .finally(() => {
+        if (sessionAbort === controller) sessionAbort = null;
+        if (backgroundRefresh === refresh) {
+          backgroundRefresh = null;
+          backgroundCredentialSnapshot = null;
+        }
+      });
+    return refresh;
+  };
+
+  pi.on("session_start", () => {
+    if (!backgroundRefresh) startRefresh(false, true);
+  });
+
+  pi.on("session_shutdown", () => {
+    sessionAbort?.abort();
+    sessionAbort = null;
+    backgroundRefresh = null;
+    backgroundCredentialSnapshot = null;
   });
 
   pi.registerCommand("alibaba", {
@@ -924,10 +1052,10 @@ export default async function (pi: ExtensionAPI) {
           cache ? Math.round((Date.now() - cache.fetchedAt) / 60000) : null;
         const planCache = readJSON<PlanCache | null>(PLAN_CACHE_PATH, null);
         const planAge = ageMin(planCache);
-        const planLive = planCache && planAge !== null && planCache.models.length === planDefs.length;
-        const planState = planLive
-          ? `live, ${planAge}m old`
-          : planDefs.length ? "live, not cached" : "not fetched";
+        const planCached = planCache && planAge !== null && planCache.models.length === planDefs.length;
+        const planState = planCached
+          ? `cached, ${planAge}m old`
+          : planDefs.length ? "loaded, not cached" : "not fetched";
         const lines = [
           `Plan:  ${planCred ? "logged in" : "not logged in"}`,
           `       Anthropic: ${endpoints.anthropic}`,
@@ -941,8 +1069,8 @@ export default async function (pi: ExtensionAPI) {
           const models = cloudDefsByProvider[provider.id];
           const keyPresent = Boolean(readCloudKey(provider));
           const modelCount = keyPresent && cache ? models.length : 0;
-          const live = keyPresent && cache && age !== null && cache.models.length === models.length;
-          const state = live ? `live, ${age}m old` : "not fetched";
+          const cached = keyPresent && cache && age !== null && cache.models.length === models.length;
+          const state = cached ? `cached, ${age}m old` : "not fetched";
           const authState = auth[provider.id]
             ? "logged in"
             : process.env[provider.apiKeyEnv]
@@ -971,11 +1099,14 @@ export default async function (pi: ExtensionAPI) {
 
       if (choice === "Refresh model lists") {
         try {
-          const currentPlanCred = readAuth()["alibaba-plan"];
-          const [, cloudResults] = await Promise.all([
-            loadPlanDefs(true, currentPlanCred).then((models) => { planDefs = models; }),
-            refreshCloudProviders(true),
-          ]);
+          const currentCredentialSnapshot = credentialSnapshot();
+          if (backgroundRefresh && backgroundCredentialSnapshot !== currentCredentialSnapshot) {
+            sessionAbort?.abort();
+            sessionAbort = null;
+            backgroundRefresh = null;
+            backgroundCredentialSnapshot = null;
+          }
+          const cloudResults = await (backgroundRefresh ?? startRefresh(true, false));
           const cloudSummary = cloudResults
             .map((result) => {
               if (!result.keyPresent) return `${result.provider.id}: skipped`;
@@ -1112,6 +1243,17 @@ export default async function (pi: ExtensionAPI) {
           "Reset all Alibaba settings?",
           "Wipes config, Plan auth, regional Cloud auth entries, all model caches, and Alibaba entries in settings.json.",
         )) return;
+        sessionAbort?.abort();
+        if (backgroundRefresh) {
+          try {
+            await backgroundRefresh;
+          } catch {
+            // Expected when cancelling an in-flight catalog refresh.
+          }
+        }
+        sessionAbort = null;
+        backgroundRefresh = null;
+        backgroundCredentialSnapshot = null;
         for (const cachePath of [
           CONFIG_PATH,
           PLAN_CACHE_PATH,

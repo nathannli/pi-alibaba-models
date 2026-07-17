@@ -67,7 +67,7 @@ rm -f ~/.pi/agent/alibaba-config.json ~/.pi/agent/alibaba-*-models.cache.json ~/
 
 All four providers register simultaneously. Cloud credentials remain independent, so any combination of regions can be active at once. The Plan provider stores chosen endpoints in its credential metadata.
 
-> **Cloud without `/login`:** regional providers also read `DASHSCOPE_API_KEY`, `DASHSCOPE_CN_API_KEY`, and `DASHSCOPE_GLOBAL_API_KEY`, respectively. Each provider fetches its live catalog at startup. With no credential, it remains visible in `/login → Use an API key` through a placeholder model.
+> **Cloud without `/login`:** regional providers also read `DASHSCOPE_API_KEY`, `DASHSCOPE_CN_API_KEY`, and `DASHSCOPE_GLOBAL_API_KEY`, respectively. Each provider registers its cached catalog immediately, then refreshes from the live API in the background. With no credential, it remains visible in `/login → Use an API key` through a placeholder model.
 
 ### Endpoints
 
@@ -112,14 +112,14 @@ The login flow validates the prefix and offers to redirect you to the correct pr
 
 Plan models come from the Plan endpoint's live `/compatible-mode/v1/models` response. Cloud models prefer Alibaba's rich `/api/v1/models` catalogs for context windows, output limits, modalities, capabilities, and regional pricing. If a rich catalog fails or times out, the extension falls back to that region's compatible `/v1/models` endpoint.
 
-Each catalog has a separate last-known-good disk cache. Network failures use the matching cache instead of preventing pi from starting. Force all regions to refresh in parallel from `/alibaba → Refresh model lists`.
+Each catalog has a separate last-known-good disk cache. Startup registers those cached models without waiting for the network, then refreshes authenticated catalogs in parallel in the background. Network failures retain the matching cache. Force all regions to refresh from `/alibaba → Refresh model lists`.
 
 ## Limitations & Known Issues
 
 - **DeepSeek Compatibility**: The Anthropic-compatible path on the Alibaba Plan host often hangs or times out for DeepSeek models. To resolve this seamlessly, this extension automatically forces any model ID containing `deepseek` to use the **OpenAI-completions endpoint** instead.
 - **Model Availability (404s)**: The model picker displays the universally *advertised* catalog. However, if your specific Alibaba Cloud account or Model Studio subscription tier does not include access to a specific model, the API will return a `model_not_found` error only when you actually attempt to send a message.
 - **API Wrapper Quirks**: Alibaba's native Anthropic compatibility layer can occasionally be strict or quirky with complex parallel tool calls. If you experience systemic parsing errors on DashScope, you can use the `/alibaba` command to switch your Cloud API format to "OpenAI".
-- **Dynamic Caching**: Model lists are cached for 4 hours. If a new model drops and you don't see it, run `/alibaba` -> `Refresh model lists`.
+- **Dynamic Caching**: Model lists use last-known-good disk caches while models.dev metadata is cached for 24 hours. If a new model drops and you don't see it, run `/alibaba` -> `Refresh model lists`.
 - **Inferred Context Windows**: The `/v1/models` API returns only ids and names, so context windows are inferred from the model id. If a brand-new model shows the wrong size, fix it yourself with `/alibaba → Context Window — Override` (per model, or `*` for all) — no extension update needed.
 
 ## `/alibaba` command reference
@@ -137,7 +137,7 @@ Each catalog has a separate last-known-good disk cache. Network failures use the
 
 ## Troubleshooting
 
-- **Model picker shows "No matching models"** → run `/login`, pick the right Alibaba entry, paste your key. Models register only after a successful login (Cloud fetches its real model list at boot from the live key).
+- **Model picker shows "No matching models"** → run `/login`, pick the right Alibaba entry, paste your key, then run `/alibaba → Refresh model lists`. Cached models register immediately on later boots.
 - **`sk-sp-` accidentally pasted into the Cloud slot** → run `/alibaba → Re-login Cloud`, then `/login → Alibaba Model Studio Coding Plan` and paste it there. (The login validators will also catch this and offer to redirect you.)
 - **DeepSeek hangs / times out** → make sure you're on the latest version of this extension; it forces DeepSeek to OpenAI-compat. If you customised plan endpoints, verify the OpenAI URL ends in `/compatible-mode/v1`.
 - **Plan picker shows models that 404 at request time** → your subscription tier may not include every advertised model. The picker shows whatever upstream advertises; the API tells you "model_not_found" only when you actually call it.
