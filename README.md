@@ -119,7 +119,7 @@ Each catalog has a separate last-known-good disk cache. Startup registers those 
 - **DeepSeek Compatibility**: The Anthropic-compatible path on the Alibaba Plan host often hangs or times out for DeepSeek models. To resolve this seamlessly, this extension automatically forces any model ID containing `deepseek` to use the **OpenAI-completions endpoint** instead.
 - **Model Availability (404s)**: The model picker displays the universally *advertised* catalog. However, if your specific Alibaba Cloud account or Model Studio subscription tier does not include access to a specific model, the API will return a `model_not_found` error only when you actually attempt to send a message.
 - **API Wrapper Quirks**: Alibaba's native Anthropic compatibility layer can occasionally be strict or quirky with complex parallel tool calls. If you experience systemic parsing errors on DashScope, you can use the `/alibaba` command to switch your Cloud API format to "OpenAI".
-- **Dynamic Caching**: Model lists use last-known-good disk caches while models.dev metadata is cached for 24 hours. If a new model drops and you don't see it, run `/alibaba` -> `Refresh model lists`.
+- **Dynamic Caching**: Model lists use last-known-good disk caches. If a new model drops and you don't see it, run `/alibaba` -> `Refresh model lists`.
 - **Inferred Context Windows**: The `/v1/models` API returns only ids and names, so context windows are inferred from the model id. If a brand-new model shows the wrong size, fix it yourself with `/alibaba → Context Window — Override` (per model, or `*` for all) — no extension update needed.
 
 ## `/alibaba` command reference
@@ -153,7 +153,6 @@ Each catalog has a separate last-known-good disk cache. Startup registers those 
 | `~/.pi/agent/alibaba-cloud-models.cache.json`         | International Cloud model cache     |
 | `~/.pi/agent/alibaba-cn-models.cache.json`            | China Cloud model cache             |
 | `~/.pi/agent/alibaba-global-models.cache.json`        | Global Cloud model cache            |
-| `~/.pi/agent/alibaba-models-dev.cache.json`           | models.dev metadata cache           |
 
 ## From the same author
 
